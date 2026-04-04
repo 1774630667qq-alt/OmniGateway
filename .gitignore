@@ -1,0 +1,15 @@
+# Build files
+build/
+bin/
+lib/
+
+# Compilation database
+compile_commands.json
+
+# IDE config
+.vscode/
+
+# Temporary files
+*.swp
+*.bak
+.DS_Store
