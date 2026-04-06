@@ -2,98 +2,104 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-04-04 16:15:45
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-04 17:04:34
+ * @LastEditTime: 2026-04-04 18:08:09
  * @FilePath: /OmniGateway/src/main.cpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
  * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
 #include "EventLoop.hpp"
+#include "HttpServer.hpp"
 #include "HttpRequest.hpp"
 #include "HttpResponse.hpp"
-#include "HttpServer.hpp"
-#include "Logger.hpp"
 #include "ThreadPool.hpp"
+#include "Logger.hpp"
 #include "json.hpp"
+#include <string>
+#include <signal.h>
 
 using namespace MyServer;
 using json = nlohmann::json;
 
-/**
- * @brief 核心翻译函数：将 Anthropic 格式的请求体，转换为 OpenAI 格式
- * @param anthropic_str 原始的 Claude 请求 JSON 字符串
- * @param target_model  我们要转发给的真实大模型 ID (比如你的 GLM-5)
- * @return 转换后的 OpenAI 格式 JSON 字符串
- */
-std::string translateAnthropicToOpenAI(const std::string &anthropic_str,
-                                       const std::string &target_model) {
-    // 1. 将普通字符串解析为极其强大的 C++ JSON 对象
-    json anthropic_json = json::parse(anthropic_str);
-
-    // 2. 创建一个空的 OpenAI JSON 对象，准备组装
-    json openai_json;
-
-    // 3. 强行替换 Model 为你白山智算的 GLM-5
-    openai_json["model"] = target_model;
-
-    // 4. 准备一个新的 messages 数组
-    openai_json["messages"] = json::array();
-
-    // 5. 【核心翻译逻辑】：处理 System Prompt 的差异
-    // 如果 Anthropic 请求里带有 system 字段
-    if (anthropic_json.contains("system")) {
-        // 在 OpenAI 的 messages 最前面，塞入一条 role 为 system 的消息
-        openai_json["messages"].push_back(
-            {{"role", "system"}, {"content", anthropic_json["system"]}});
-    }
-
-    // 6. 把原本的 messages 原封不动地拷贝过来
-    if (anthropic_json.contains("messages")) {
-        for (const auto &msg : anthropic_json["messages"]) {
-            openai_json["messages"].push_back(msg);
+// 你亲手写的核心翻译官
+std::string translateAnthropicToOpenAI(const std::string& anthropic_str, 
+                                    const std::string& target_model) {
+    try {
+        json anthropic_json = json::parse(anthropic_str);
+        json openai_json;
+        openai_json["model"] = target_model;
+        openai_json["messages"] = json::array();
+        
+        if (anthropic_json.contains("system")) {
+            openai_json["messages"].push_back({
+                {"role", "system"},
+                {"content", anthropic_json["system"]}
+            });
         }
+        
+        if (anthropic_json.contains("messages")) {
+            for (const auto& msg : anthropic_json["messages"]) {
+                openai_json["messages"].push_back(msg);
+            }
+        }
+        
+        if (anthropic_json.contains("temperature")) {
+            openai_json["temperature"] = anthropic_json["temperature"];
+        }
+        
+        return openai_json.dump(); // 实际网络传输，不要空格，极致压缩！
+    } catch (const std::exception& e) {
+        LOG_ERROR << "JSON 解析/转换失败: " << e.what();
+        return ""; // 如果传过来的不是合法 JSON，防崩溃
     }
-
-    // 7. 还可以把其他参数（比如 max_tokens, temperature）也拷贝过去
-    // (这里做个简单的演示)
-    if (anthropic_json.contains("temperature")) {
-        openai_json["temperature"] = anthropic_json["temperature"];
-    }
-
-    // 8. 序列化：将 C++ JSON 对象重新变回人类可读的字符串，缩进为 4 个空格
-    return openai_json.dump(4);
 }
 
 int main() {
-    // 1. 初始化全局异步日志
-    initGlobalLogger("OmniGateway");
+    signal(SIGPIPE, SIG_IGN); // 忽略断开信号，防崩溃
+    MyServer::initGlobalLogger("OmniGatewayLog");
 
-    LOG_INFO << "Starting OmniGateway...";
-
-    // 2. 创建主 Reactor
     EventLoop loop;
+    ThreadPool pool(4); // 网关主要做 IO 转发，工作线程不需要太多，4 个足矣
 
-    // 3. 创建业务线程池，处理具体请求
-    ThreadPool pool(8);
+    // 在 8080 端口启动我们的代理网关
+    HttpServer gateway_server(&loop, 8080, &pool);
+    gateway_server.setThreadNum(2); 
 
-    // 4. 创建 HttpServer
-    HttpServer server(&loop, 8080, &pool);
+    gateway_server.setHttpCallback([](const HttpRequest& req, HttpResponse& res) {
+        LOG_INFO << "收到来自客户端的请求: " << req.getMethod() << " " << req.getPath();
 
-    // 设置网络 IO 线程数 (Sub Reactors)
-    server.setThreadNum(4);
+        // 拦截 Claude Code 发往 Anthropic 官方的默认接口地址：/v1/messages
+        if (req.getPath() == "/v1/messages" && req.getMethod() == "POST") {
+            
+            // 1. 从 HTTP 请求体中掏出 Claude 给我们的原始数据
+            std::string claude_body = req.getBody();
+            LOG_INFO << "接收到 Claude 的数据，长度: " << claude_body.size() << " bytes";
 
-    // 5. 注册路由回调
-    server.setHttpCallback([](const HttpRequest &req, HttpResponse &resp) {
-        LOG_INFO << "Received HTTP request";
+            // 2. 调用翻译引擎 (目标设为白山智算的 GLM-5)
+            std::string openai_body = translateAnthropicToOpenAI(claude_body, "GLM-5");
 
-        resp.setStatusCode(200, "OK");
-        resp.addHeader("Content-Type", "text/plain");
-        resp.setBody("Welcome to OmniGateway!\n");
+            if (openai_body.empty()) {
+                res.setStatusCode(400, "Bad Request");
+                res.setBody("{\"error\": \"Invalid JSON Format\"}");
+                res.addHeader("Content-Type", "application/json");
+                return;
+            }
+
+            // 3. (暂不发往白山智算) 我们先把翻译好的数据直接作为 HTTP 响应返回，方便调试！
+            res.setStatusCode(200, "OK");
+            res.addHeader("Content-Type", "application/json");
+            res.setBody(openai_body);
+            
+            LOG_INFO << "成功完成协议翻译并返回响应！";
+        } 
+        else {
+            // 对付那些乱请求的路径
+            res.setStatusCode(404, "Not Found");
+            res.setBody("OmniGateway: Path not supported yet.");
+        }
     });
 
-    // 6. 启动服务器与事件循环
-    server.start();
-    LOG_INFO << "OmniGateway is listening on port 8080...";
-
+    LOG_INFO << "OmniGateway 引擎启动成功！正在监听 8080 端口...";
+    gateway_server.start();
     loop.loop();
 
     return 0;
