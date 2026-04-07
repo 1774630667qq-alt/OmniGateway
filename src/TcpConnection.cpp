@@ -49,54 +49,41 @@ namespace MyServer {
         if (state_ != StateE::kConnected) return;
         // 使用智能指针守卫，防止在回调过程中自己被析构导致崩溃
         auto guard = shared_from_this();
-        int active_fd = channel_->getFd();
-        while (true) {
-            char buf[1024];
-            /**
-             * @brief 从套接字接收数据 (系统调用)
-             * @param sockfd  用于接收数据的套接字文件描述符 (此处的 active_fd)
-             * @param buf     指向存放接收数据缓冲区的指针
-             * @param len     缓冲区的最大长度
-             * @param flags   接收操作的标志位，通常设为 0
-             * @return 成功返回实际接收到的字节数；返回 0 表示对端已正常关闭连接；失败返回 -1 并设置 errno
-             */
-            int bytes_read = recv(active_fd, buf, sizeof(buf), 0);
-            if (bytes_read > 0) {
-                buffer_.append(buf, bytes_read); // 把读到的数据追加到缓冲区
-                // 每次读到数据都要续命一下，重置秒表
-                extendLife();
-            } else if (bytes_read == -1){
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // 没有更多数据可读了，退出循环
-                    break;
-                } else {
-                    LOG_ERROR << "Recv 失败!";
-                    state_ = StateE::kDisconnecting;
-                    channel_->disableAll(); // 立即从 epoll 中注销，防止后续事件重入
-                    // 将回调拷贝到栈上，防止对象自杀导致段错误
-                    auto cb = closeCallback_;
-                    if (cb) {
-                        cb(guard);
-                    }
-                    return; // close 后直接返回，不再执行 messageCallback_
-                }
-            } else {
-                // bytes_read == 0，客户端断开连接
-                LOG_INFO << "客户端 fd " << active_fd << " 断开连接";
-                state_ = StateE::kDisconnecting;
-                channel_->disableAll(); // 立即从 epoll 中注销，防止后续事件重入
-                // 同理，拷贝到栈上安全执行
-                auto cb = closeCallback_;
-                if (cb) {
-                    cb(guard);
-                }
-                return; // close 后直接返回，不再执行 messageCallback_
-            }
-        }
 
-        if (state_ == StateE::kConnected) {
+        int savedErrno = 0;
+        /**
+         * @brief 通过 Buffer::readFd() 从套接字高效读取数据
+         * @details readFd 内部使用 readv() scatter/gather IO + ET 循环榨干策略：
+         *   - iov[0] 指向 Buffer 自身的可写区域（堆内存）
+         *   - iov[1] 指向栈上 64KB 的 extrabuf（溢出着陆区）
+         *   - 在 while(true) 中循环调用 readv，直到 EAGAIN 表示内核缓冲区已抽干
+         * @return >0 实际读取总字节数；0 对端关闭；-1 不可恢复错误
+         */
+        ssize_t n = buffer_.readFd(fd_, &savedErrno);
+
+        if (n > 0) {
+            // 成功读取到数据，续命并触发业务层回调
+            extendLife();
             if (messageCallback_) {
                 messageCallback_(guard, &buffer_);
+            }
+        } else if (n == 0) {
+            // 对端关闭连接（收到 FIN）
+            LOG_INFO << "客户端 fd " << fd_ << " 断开连接";
+            state_ = StateE::kDisconnecting;
+            channel_->disableAll(); // 立即从 epoll 中注销，防止后续事件重入
+            auto cb = closeCallback_;
+            if (cb) {
+                cb(guard);
+            }
+        } else {
+            // 不可恢复的读取错误
+            LOG_ERROR << "readFd 失败! errno=" << savedErrno;
+            state_ = StateE::kDisconnecting;
+            channel_->disableAll();
+            auto cb = closeCallback_;
+            if (cb) {
+                cb(guard);
             }
         }
     }
