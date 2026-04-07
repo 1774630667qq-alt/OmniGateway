@@ -78,7 +78,7 @@ private:
      * @brief 指数退避重连算法
      * 防止因服务端宕机导致客户端疯狂发起连接而耗尽本地端口或 CPU
      */
-    void retry(int sockfd);
+    void retry(int sockfd, int savedErrno = 0);
 
     // 运行所在的事件循环
     EventLoop* loop_;           
@@ -92,6 +92,6 @@ private:
     NewConnectionCallback newConnectionCallback_; 
 
     // 当前重连延迟时间 (ms)
-    int retryDelayMs_; 
+    int retryDelayMs_ = 500;  ///< 初始重连延迟 500ms，每次翻倍，上限 30s
 };
 }

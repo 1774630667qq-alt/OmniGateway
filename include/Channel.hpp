@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-03-19 15:19:59
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-03-19 15:54:55
+ * @LastEditTime: 2026-04-06 19:36:04
  * @FilePath: /ServerPractice/include/Channel.hpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -98,6 +98,11 @@ public:
      * @details 将事件掩码清零，并更新底层的 epoll 实例。在对象析构前调用，防止发生幽灵事件。
      */
     void disableAll();
+
+    /**
+     * @brief 从 epoll 树中移除自身
+     */
+    void remove();
 
     // --- Getter 和 Setter ---
     int getFd() const { return fd_; }

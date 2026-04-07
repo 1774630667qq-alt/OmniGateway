@@ -61,4 +61,8 @@ namespace MyServer {
         events_ = 0;
         loop_->updateChannel(this);
     }
+
+    void Channel::remove() {
+        loop_->removeChannel(this);
+    }
 }

@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-03-19 15:20:10
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-03-29 22:34:11
+ * @LastEditTime: 2026-04-06 19:35:41
  * @FilePath: /ServerPractice/include/EventLoop.hpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -100,6 +100,8 @@ public:
     void quit() {
         quit_ = true;
     }
+
+    void removeChannel(Channel* channel);
 };
 
 } // namespace MyServer

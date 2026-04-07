@@ -147,4 +147,15 @@ namespace MyServer
     std::shared_ptr<Timer> EventLoop::runAfter(int timeout_ms, TimeoutCallback cb) {
         return timerQueue_->addTimer(timeout_ms, std::move(cb));
     }
+
+    void EventLoop::removeChannel(Channel* channel) {
+        int fd = channel->getFd();
+    
+        // 使用 EPOLL_CTL_DEL 从内核 epoll 红黑树中彻底删除该 fd
+        struct epoll_event ev;
+        // 内核在 DEL 操作时，其实不需要 ev 里的 events 和 data，但为了兼容早期的 Linux 版本，传一个合法的指针更安全
+        if (epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, &ev) == -1) {
+            LOG_ERROR << "Epoll 删除 Channel 失败! fd: " << fd;
+        }
+    }
 }
