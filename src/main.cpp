@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-04-04 16:15:45
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-04 18:08:09
+ * @LastEditTime: 2026-04-09 15:54:11
  * @FilePath: /OmniGateway/src/main.cpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
  * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
@@ -16,6 +16,7 @@
 #include "json.hpp"
 #include <string>
 #include <signal.h>
+#include "SSLManager.hpp"
 
 using namespace MyServer;
 using json = nlohmann::json;
@@ -54,6 +55,7 @@ std::string translateAnthropicToOpenAI(const std::string& anthropic_str,
 }
 
 int main() {
+    SSLManager::init();
     signal(SIGPIPE, SIG_IGN); // 忽略断开信号，防崩溃
     MyServer::initGlobalLogger("OmniGatewayLog");
 

@@ -25,3 +25,6 @@ add_executable(OmniGateway ${SOURCES})
 
 # 链接多线程库
 target_link_libraries(OmniGateway PRIVATE Threads::Threads)
+
+# 将项目根目录路径注入为编译期宏，供 SSL 证书等资源定位使用
+target_compile_definitions(OmniGateway PRIVATE PROJECT_ROOT="${PROJECT_SOURCE_DIR}")
