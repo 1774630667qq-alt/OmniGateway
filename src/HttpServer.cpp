@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-03-26 17:41:20
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-03-31 22:47:51
+ * @LastEditTime: 2026-04-11 17:05:40
  * @FilePath: /ServerPractice/src/HttpServer.cpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -85,19 +85,6 @@ namespace MyServer {
                 if (cb) {
                     cb(request, response); // 业务层处理请求，填充响应
                 }
-
-                bool isFile = response.isFile();
-                std::string response_str = isFile ? response.assembleHeaders() : response.assemble(); // 如果是文件，只拼装头部，文件内容留给 TcpConnection 的 sendfile 去发
-                std::string filePath = response.getFilePath();
-
-                EventLoop* loop = conn->getLoop();
-                loop->queueInLoop([conn, response_str, isFile, filePath]() {
-                    conn->send(response_str); // 先发响应行和响应头
-                    if (isFile) {
-                        conn->sendFile(filePath); // 再发文件内容
-                    }
-                });
-                
             });
         }
     }

@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-03-22 20:28:39
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-07 17:21:00
+ * @LastEditTime: 2026-04-11 14:54:33
  * @FilePath: /OmniGateway/include/Buffer.hpp
  * @Description: 工业级动态缓冲区，基于 vector<char> + 双游标设计
  */
@@ -79,13 +79,14 @@ public:
     const char* peek() const { return begin() + readerIndex_; }
 
     /**
-     * @brief 在可读区域中查找 "\r\n\r\n" 的位置
-     * @return 找到则返回 "\r\n\r\n" 相对于 peek() 的偏移量；未找到返回 std::string::npos
-     */
-    size_t findCRLF() const {
-        const char* crlf = std::search(peek(), beginWrite(), kCRLF, kCRLF + 4);
-        return crlf == beginWrite() ? std::string::npos
-                                    : static_cast<size_t>(crlf - peek());
+    * @brief 在可读区域中查找特定的字符串（默认查找 HTTP 头结束符 "\r\n\r\n"）
+    * @param target 要查找的字符串，SSE 协议可传入 "\n\n"
+    * @return 找到则返回相对于 peek() 的偏移量；未找到返回 std::string::npos
+    */
+    size_t findCRLF(std::string_view target = kCRLF) const {
+        const char* found = std::search(peek(), beginWrite(), target.begin(), target.end());
+        return found == beginWrite() ? std::string::npos
+                                    : static_cast<size_t>(found - peek());
     }
 
     // ====================== 数据消费接口 ======================
@@ -194,6 +195,10 @@ public:
     void hasWritten(size_t len) {
         assert(len <= writableBytes());
         writerIndex_ += len;
+    }
+
+    bool empty() const {
+        return readableBytes() == 0;
     }
 
 private:

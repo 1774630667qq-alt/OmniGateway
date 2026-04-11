@@ -56,7 +56,7 @@ void TcpServer::newConnection(int fd) {
     
     // 3. 告诉客人：如果你走了，请调用我的 removeConnection 方法告诉我！
     conn->setCloseCallback(
-        std::bind(&TcpServer::removeConnection, this, std::placeholders::_1)
+        [this](const std::shared_ptr<TcpConnection>& c) { removeConnection(c); }
     );
     
     // 4. 把这个新客人登记到账本上（主线程操作 map，安全）

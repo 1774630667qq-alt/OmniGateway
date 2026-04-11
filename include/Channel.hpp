@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-03-19 15:19:59
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-06 19:36:04
+ * @LastEditTime: 2026-04-10 16:46:12
  * @FilePath: /ServerPractice/include/Channel.hpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -81,6 +81,14 @@ public:
     void enableWriting();
 
     /**
+     * @brief 判断是否正在监听“可写事件”
+     * 
+     * @return true 正在监听“可写事件”
+     * @return false 没有监听“可写事件”
+     */
+    bool isWriting() const { return events_ & EPOLLOUT; }
+
+    /**
      * @brief 取消对“可写事件”的监听
      * @details 从事件掩码中移除 EPOLLOUT 标志。当数据全部发送完毕后必须调用此方法，防止 CPU 疯狂空转
      */
@@ -92,6 +100,14 @@ public:
      * 修改自身的 events_ 掩码后，会调用所属 EventLoop 的 updateChannel 更新底层的 epoll 实例。
      */
     void enableReading();
+
+    /**
+     * @brief 判断是否正在监听“可读事件”
+     * 
+     * @return true 正在监听“可读事件”
+     * @return false 没有监听“可读事件”
+     */
+    bool isReading() const { return events_ & EPOLLIN; }
 
     /**
      * @brief 取消所有事件的监听 (优雅注销)

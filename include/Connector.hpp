@@ -1,8 +1,8 @@
 /*
  * @Author: error: error: git config user.name & please set dead value or install git && error: git config user.email & please set dead value or install git & please set dead value or install git
  * @Date: 2026-04-05 22:29:51
- * @LastEditors: error: error: git config user.name & please set dead value or install git && error: git config user.email & please set dead value or install git & please set dead value or install git
- * @LastEditTime: 2026-04-05 22:41:37
+ * @LastEditors: Zhang YuHua 1774630667@qq.com
+ * @LastEditTime: 2026-04-11 15:36:18
  * @FilePath: /OmniGateway/include/Connector.hpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -15,7 +15,7 @@ namespace MyServer{
 /**
  * @class Connector
  * @brief 主动连接器：负责在非阻塞模式下发起 TCP 连接
- * * 场景：OmniGateway 作为客户端，主动连接白山智算 API 节点。
+ * * 场景：OmniGateway 作为客户端，主动连接第三方 API 节点。
  * 角色：相当于 TcpServer 中的 Acceptor，但用于主动发起请求。
  */
 class Connector : public std::enable_shared_from_this<Connector> {

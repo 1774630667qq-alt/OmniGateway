@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-03-20 15:29:42
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-03-30 12:55:12
+ * @LastEditTime: 2026-04-11 19:05:16
  * @FilePath: /ServerPractice/include/TcpConnection.hpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -10,14 +10,13 @@
 #include <functional>
 #include <string>
 #include <memory>
-#include <queue>
 #include <sys/types.h> // 提供 off_t 类型
 #include "Buffer.hpp"
 #include "Timer.hpp"
 #include <atomic>
 
+typedef struct ssl_st SSL;
 namespace MyServer {
-
 class EventLoop;
 class Channel;
 
@@ -25,33 +24,11 @@ class Channel;
  * @brief 原子状态机，枚举类型，用于表示连接的状态
  */
 enum StateE { 
-    kConnected,     // 正常连接中
-    kDisconnecting, // 正在执行处决命令（微秒级过渡态）
+    kConnecting,    // (可选) TCP 正在连接
+    kHandshaking,   // 【新增】TCP 已连上，正在进行 TLS 握手！
+    kConnected,     // 正常连接中 (明文连上，或 TLS 握手成功)
+    kDisconnecting, // 正在执行处决命令
     kDisconnected   // 已经彻底死透了
-};
-
-/**
- * @brief 发送任务单元
- * @details 统一管理要发送的数据。它可能是一段普通的 HTTP 头部文本，也可能是一个需要零拷贝发送的巨大文件。
- */
-struct OutputItem {
-    bool is_file;           ///< 标志位：这是一个文件任务，还是普通的字符串任务？
-    
-    // --- 字符串任务专属 ---
-    std::string str_data;   ///< 如果是字符串，数据存在这里
-    
-    // --- 文件任务专属 ---
-    int file_fd;            ///< 如果是文件，存放底层打开的文件描述符
-    off_t file_offset;      ///< 当前文件发到哪个字节了
-    size_t file_size;       ///< 文件的总大小
-    
-    // 构造字符串任务
-    OutputItem(const std::string& str) 
-        : is_file(false), str_data(str), file_fd(-1), file_offset(0), file_size(0) {}
-        
-    // 构造文件任务
-    OutputItem(int fd, size_t size) 
-        : is_file(true), file_fd(fd), file_offset(0), file_size(size) {}
 };
 
 /**
@@ -63,12 +40,12 @@ struct OutputItem {
 class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
 private:
     EventLoop* loop_;       ///< 大管家 (所属的事件循环)
+    SSL* ssl_;              ///< SSL 对象
     int fd_;                ///< 与客户端通信的专属 fd
     int connId_;            ///< 唯一连接 ID（由 TcpServer 分配，防止 fd 复用导致误删）
     Channel* channel_;      ///< 属于这个 fd 的专属通信管道 (服务员)
     Buffer buffer_;         ///< 读数据的缓冲区
-    std::queue<OutputItem> outputQueue_; ///< 严格保序的发送任务队列
-    // Buffer writeBuffer_;    ///< 写数据的缓冲区
+    Buffer writeBuffer_;    ///< 写数据的缓冲区
     std::shared_ptr<Timer> keepAliveTimer_; ///< 专属秒表：如果长时间没重置，它就会引爆！
     std::atomic<StateE> state_; ///< 原子状态机，用于表示连接的状态
 
@@ -84,13 +61,18 @@ private:
      * @brief 定时器引爆时执行的踢人函数
      */
     void handleTimeout();
+
+    /**
+     * @brief 处理连接关闭事件
+     */
+    void handleClose();
 public:
     /**
      * @brief 构造函数：接管客户端文件描述符，并初始化其专属 Channel
      * @param loop 所在的 EventLoop 实例
      * @param fd 客户端已连接的非阻塞套接字文件描述符
      */
-    TcpConnection(EventLoop* loop, int fd);
+    TcpConnection(EventLoop* loop, int fd, SSL* ssl = nullptr);
     
     /**
      * @brief 析构函数：释放内部专属 Channel，并严格调用 close(fd_) 关闭底层 TCP 通信套接字
@@ -177,6 +159,31 @@ public:
      * @details 立即触发 closeCallback_ 并注销自己
      */
     void forceClose();
+
+    /**
+     * @brief 发起非阻塞 TLS 握手，将已建立的 TCP 连接升级为加密通道
+     * @signature void doTlsHandshake();
+     * @details
+     *   [职责]
+     *   在 TCP 三次握手完成后，对持有 SSL 对象的连接发起客户端侧的 TLS 握手。
+     *   调用 SSL_connect() 启动握手流程，并将状态机切换为 kHandshaking。
+     * 
+     *   [非阻塞握手流程]
+     *   由于底层 fd 是非阻塞的，SSL_connect() 通常不会一次性完成，而是返回
+     *   SSL_ERROR_WANT_READ 或 SSL_ERROR_WANT_WRITE，表示需要等待对端的握手报文。
+     *   此时应根据返回值注册相应的 epoll 事件（EPOLLIN / EPOLLOUT），
+     *   在后续的 handleRead() / handleWrite() 中检测到 kHandshaking 状态时
+     *   重新调用 SSL_connect() 继续握手，直到握手成功后将状态切换为 kConnected。
+     * 
+     *   [调用时机]
+     *   应在 connectEstablished() 之后，由上层（如 HttpClient::onConnection）调用。
+     *   仅对持有 ssl_ 对象的连接有效；明文连接不应调用此方法。
+     */
+    void doTlsHandshake();
+
+    void setState(StateE state) { state_ = state; }
+
+    StateE getState() const { return state_; }
 };
 
 } // namespace MyServer

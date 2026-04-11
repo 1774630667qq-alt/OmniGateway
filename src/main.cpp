@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-04-04 16:15:45
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-09 15:54:11
+ * @LastEditTime: 2026-04-09 16:25:07
  * @FilePath: /OmniGateway/src/main.cpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
  * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
@@ -103,6 +103,6 @@ int main() {
     LOG_INFO << "OmniGateway 引擎启动成功！正在监听 8080 端口...";
     gateway_server.start();
     loop.loop();
-
+    SSLManager::destroy();
     return 0;
 }

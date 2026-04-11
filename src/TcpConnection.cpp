@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-03-20 15:29:51
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-03-31 14:03:32
+ * @LastEditTime: 2026-04-11 15:19:05
  * @FilePath: /ServerPractice/src/TcpConnection.cpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -15,10 +15,14 @@
 #include <unistd.h>
 #include <sys/sendfile.h> // 提供 sendfile 函数
 #include <fcntl.h> // 提供 open 函数和 O_RDONLY 标志
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <sys/errno.h>
 
 namespace MyServer {
-    TcpConnection::TcpConnection(EventLoop* loop, int fd)
-        : loop_(loop), fd_(fd), connId_(-1), state_(StateE::kConnected) {
+    TcpConnection::TcpConnection(EventLoop* loop, int fd, SSL* ssl)
+        : loop_(loop), fd_(fd), ssl_(ssl), connId_(-1),
+          state_(ssl ? StateE::kConnecting : StateE::kConnected) {
         channel_ = new Channel(loop_, fd_);
         // 绑定读事件的回调函数
         channel_->setReadCallback(std::bind(&TcpConnection::handleRead, this));
@@ -27,14 +31,6 @@ namespace MyServer {
     }
 
     TcpConnection::~TcpConnection() {
-        // 析构时必须关闭底层文件描述符，防止幽灵连接
-        while (!outputQueue_.empty()) {
-            OutputItem& item = outputQueue_.front();
-            if (item.is_file) {
-                ::close(item.file_fd);
-            }
-            outputQueue_.pop();
-        }
         channel_->disableAll();
         delete channel_;
         ::close(fd_); // 必须关闭底层文件描述符，防止幽灵连接
@@ -45,160 +41,294 @@ namespace MyServer {
     }
 
     void TcpConnection::handleRead() {
-        // 如果连接已经不在正常状态，直接忽略，防止重入
-        if (state_ != StateE::kConnected) return;
+        int savedErrno = 0;
+        // kHandshaking 时也需要进入（TLS 握手可能需要读取对端报文）
+        if (state_ != StateE::kConnected && state_ != StateE::kHandshaking) return;
         // 使用智能指针守卫，防止在回调过程中自己被析构导致崩溃
         auto guard = shared_from_this();
 
-        int savedErrno = 0;
-        /**
-         * @brief 通过 Buffer::readFd() 从套接字高效读取数据
-         * @details readFd 内部使用 readv() scatter/gather IO + ET 循环榨干策略：
-         *   - iov[0] 指向 Buffer 自身的可写区域（堆内存）
-         *   - iov[1] 指向栈上 64KB 的 extrabuf（溢出着陆区）
-         *   - 在 while(true) 中循环调用 readv，直到 EAGAIN 表示内核缓冲区已抽干
-         * @return >0 实际读取总字节数；0 对端关闭；-1 不可恢复错误
-         */
-        ssize_t n = buffer_.readFd(fd_, &savedErrno);
+        if (ssl_) { // 密文数据
+            char extrabuf[65536]; // 栈上缓冲区，用于接收 SSL 解密后的数据
+            while (true) { // 边缘触发模式下，必须使用 while 循环榨干数据
+                /**
+                 * @brief 清空当前线程的 OpenSSL 错误队列
+                 * @signature void ERR_clear_error(void);
+                 * @details 
+                 *   [职责]
+                 *   在调用可能会产生新错误的 OpenSSL API（如 SSL_read 或 SSL_write）之前，
+                 *   必须清理错误队列，避免将之前遗留的（可能是其他操作或忽略的）错误
+                 *   误认为是当前操作产生的错误。
+                 * 
+                 *   [工作流程]
+                 *   1. 访问当前线程局部的 OpenSSL 错误记录堆栈。
+                 *   2. 释放并清空所有挂起的旧错误记录（包括错误码、文件、行号等上下文）。
+                 *   3. 重置状态，为后续真实的错误捕获提供干净的画布。
+                 * 
+                 *   [生命周期与上下文]
+                 *   OpenSSL 的错误队列是线程局部存储（Thread-Local Storage, TLS）的。
+                 *   这意味着虽然多个并发连接可能在同一个或不同的 IO 线程被处理，
+                 *   但此函数只安全地清空当前执行线程的队列，完全契合多线程 Reactor 模型。
+                 * 
+                 * @return 无返回值。
+                 */
+                ERR_clear_error();
+                
+                int readbytes = SSL_read(ssl_, extrabuf, sizeof(extrabuf));
+                if (readbytes > 0) { // 成功读取到数据
+                    buffer_.append(extrabuf, readbytes);
+                    extendLife();
+                } else { 
+                    /**
+                     * @brief 根据 I/O 操作的返回值提取 OpenSSL 具体的错误码
+                     * @signature int SSL_get_error(const SSL *ssl, int ret_code);
+                     * @param ssl 当前操作所使用的 SSL 会话对象指针
+                     * @param ret_code 最近一次引发错误的 OpenSSL 读/写函数（如 SSL_read/SSL_write）的返回值
+                     * 
+                     * @details 
+                     *   [职责]
+                     *   当 SSL_read() / SSL_write() 等 I/O 函数返回 <= 0 的值时，仅表明操作未完成。为了区分是
+                     *   底层非阻塞导致的“假错误”，还是由于对端断开、握手异常导致的“真错误”，必须立刻调用本函数来解析。
+                     * 
+                     *   [生命周期与上下文约束]
+                     *   重要：调用顺序极为严格！该函数必须紧跟在诱发错误的 I/O 操作之后调用。
+                     *   在这两次调用之间，绝不能调用任何其他可能改写全局错误队列的 OpenSSL 函数，
+                     *   否则提取到的错误状态可能会受到干扰导致严重 Bug。
+                     * 
+                     *   [各个错误信息表示的含义及生命周期应对策略]
+                     *   - SSL_ERROR_NONE:
+                     *     说明底层的 I/O 操作实际上是成功的（由于本分支是针对 readbytes <= 0 的拦截，通常不会是这个码）。
+                     * 
+                     *   - SSL_ERROR_WANT_READ:
+                     *     说明当前连接正在等待对端发送更多数据。例如：在读取应用数据时，底层收取到了部分密文，
+                     *     但其长度不足以被 AES 层解密拼凑出一个完整的 TLS 记录（TLS Record），导致操作处于“受阻渴望数据”状态。
+                     *     【应对策略】：在 epoll 中保持或激活对此文件描述符的 EPOLLIN (读) 监听，一旦新数据抵达底座，即可重试。
+                     * 
+                     *   - SSL_ERROR_WANT_WRITE:
+                     *     说明当前连接需要向对端发送数据，但本端的底层系统发送缓冲区已被塞满。为什么读操作(SSL_read)
+                     *     也会引发写受阻？因为 TLS 协议存在 "Renegotiation(重协商)" 会话机制，此时要求引擎偷偷地双向通信。
+                     *     【应对策略】：在 epoll 中临时添加对此文件描述符的 EPOLLOUT (写) 监听，等底座变成可写状态时重试。
+                     * 
+                     *   - SSL_ERROR_ZERO_RETURN:
+                     *     说明对端的 TLS 栈发送了纯正的 "close notify" 控制报文，宣告其完成了数据的发送任务，期望有序告别。
+                     *     【应对策略】：我们收到此信号后，也应妥善走完应用层的清理工作，关闭套接字并断开自身。
+                     * 
+                     *   - SSL_ERROR_SYSCALL:
+                     *     遇到了惨烈的、不可恢复的底层 Linux 操作系统连接溃败（如遭到 RST，或断网导致的 Pipe Broken）。
+                     *     【应对策略】：需使用传统的 errno 来获取系统调用失败源头，之后彻底废弃此连接。
+                     * 
+                     *   - SSL_ERROR_SSL:
+                     *     遇到了致命的、不可重试的加密层异常。典型的重金灾区：MAC (消息摘要) 计算未过关被发现遭遇中间人纂改、
+                     *     客户端私自发来不受支持的降级协议等。
+                     *     【应对策略】：此时可以通过前人留下的 ERR_print_errors 打印具体错误原因链路，然后毫不犹豫地拔除该连接。
+                     * 
+                     * @return 转换后能够直观表示上述某种状态分支的专属宏常量（整型）。
+                     */
+                    int sslError = SSL_get_error(ssl_, readbytes);
+                    
+                    if (sslError == SSL_ERROR_WANT_READ) {
+                        // 情况一：底层密文已经被榨干，但是凑不出一个完整的解密块
+                        // 保持此时的 EPOLLIN 监听状态，退出循环
+                        if (!channel_->isReading()) {
+                            channel_->enableReading();
+                        }
+                        break;
+                    } else if (sslError == SSL_ERROR_WANT_WRITE) {
+                        // 情况三：读着读着，OPEN_SSL 突然需要发送底层报文，且发送不出去
+                        // 保持此时的 EPOLLOUT 监听状态，退出循环
+                        LOG_ERROR << "SSL_read 引发 WANT_WRITE, 打开 EPOOLOUT";
+                        if (!channel_->isWriting()) {
+                            channel_->enableWriting();
+                        }
+                        break;
+                    } else if (sslError == SSL_ERROR_ZERO_RETURN) {
+                        // 对端发送了 TLS "Close Notify" 告警报文，正在有序关闭 SSL 连接
+                        handleClose();
+                        break;
+                    } else {
+                        // 出现不可恢复的硬性错误，如（解密失败，证书错误，物理网络断开）
+                        ERR_print_errors_fp(stderr);
+                        handleClose();
+                        break;
+                    }
+                }
+            }
+        } else { // 明文数据
+            /**
+            * @brief 通过 Buffer::readFd() 从套接字高效读取数据
+            * @details readFd 内部使用 readv() scatter/gather IO + ET 循环榨干策略：
+            *   - iov[0] 指向 Buffer 自身的可写区域（堆内存）
+            *   - iov[1] 指向栈上 64KB 的 extrabuf（溢出着陆区）
+            *   - 在 while(true) 中循环调用 readv，直到 EAGAIN 表示内核缓冲区已抽干
+            * @return >0 实际读取总字节数；0 对端关闭；-1 不可恢复错误
+            */
+            ssize_t n = buffer_.readFd(fd_, &savedErrno);
 
-        if (n > 0) {
-            // 成功读取到数据，续命并触发业务层回调
-            extendLife();
-            if (messageCallback_) {
-                messageCallback_(guard, &buffer_);
-            }
-        } else if (n == 0) {
-            // 对端关闭连接（收到 FIN）
-            LOG_INFO << "客户端 fd " << fd_ << " 断开连接";
-            state_ = StateE::kDisconnecting;
-            channel_->disableAll(); // 立即从 epoll 中注销，防止后续事件重入
-            auto cb = closeCallback_;
-            if (cb) {
-                cb(guard);
-            }
-        } else {
-            // 不可恢复的读取错误
-            LOG_ERROR << "readFd 失败! errno=" << savedErrno;
-            state_ = StateE::kDisconnecting;
-            channel_->disableAll();
-            auto cb = closeCallback_;
-            if (cb) {
-                cb(guard);
+            if (n > 0) {
+                // 成功读取到数据，续命并触发业务层回调
+                extendLife();
+                if (messageCallback_) {
+                    messageCallback_(guard, &buffer_);
+                }
+            } else if (n == 0) {
+                // 对端关闭连接（收到 FIN）
+                LOG_INFO << "客户端 fd " << fd_ << " 断开连接";
+                state_ = StateE::kDisconnecting;
+                channel_->disableAll(); // 立即从 epoll 中注销，防止后续事件重入
+                auto cb = closeCallback_;
+                if (cb) {
+                    cb(guard);
+                }
+            } else {
+                // 不可恢复的读取错误
+                LOG_ERROR << "readFd 失败! errno=" << savedErrno;
+                state_ = StateE::kDisconnecting;
+                channel_->disableAll();
+                auto cb = closeCallback_;
+                if (cb) {
+                    cb(guard);
+                }
             }
         }
     }
 
     void TcpConnection::send(const std::string& msg) {
-        if (state_ != StateE::kConnected) return; // 连接已断开，不再发送
-        // 不论如何先把消息放到发送队列里，保证发送的顺序
-        outputQueue_.push(OutputItem(msg));
-        if (outputQueue_.size() == 1) { // 如果之前队列是空的，说明 handleWrite() 没有在工作，需要踢一脚它了
-            handleWrite(); // 直接调用一次 handleWrite()，尝试把数据发送出去，后续如果没发完会自动注册 EPOLLOUT 继续发送
-        }
-    }
-
-    void TcpConnection::sendFile(const std::string& filepath) {
-        if (state_ != StateE::kConnected) return; // 连接已断开，不再发送
-        /**
-         * @brief 打开一个文件并获取其文件描述符 (系统调用)
-         * @signature int open(const char *pathname, int flags);
-         * @param pathname 指向要打开的文件路径的 C 风格字符串
-         * @param flags    文件访问模式和状态标志位：
-         *                 - O_RDONLY: 以只读模式打开文件。(因为发文件只需读取磁盘内容)
-         *                 - O_WRONLY: 以只写模式打开文件。
-         *                 - O_RDWR:   以读写模式打开文件。
-         *                 (还可使用按位或组合其他标志，例如 O_CREAT 创建文件、O_NONBLOCK 非阻塞打开等)
-         * @return 成功返回一个新的非负文件描述符；失败返回 -1 并自动设置 errno (例如文件不存在或权限不足)
-         */
-        int file_fd = ::open(filepath.c_str(), O_RDONLY);
-        if (file_fd == -1) {
-            LOG_ERROR << "打开文件失败: " << filepath;
+        if (state_ != StateE::kConnected) return;
+        int savedErrno = 0;
+        if (!writeBuffer_.empty()) {
+            writeBuffer_.append(msg);
             return;
         }
-        /**
-         * @brief 重新定位文件描述符的读写偏移量 (系统调用)
-         * @signature off_t lseek(int fd, off_t offset, int whence);
-         * @param fd      由 open() 返回的文件描述符
-         * @param offset  相对于 whence 的偏移量，可以是正数或负数
-         * @param whence  偏移量的基准位置：
-         *                - SEEK_SET: 从文件开头计算偏移。
-         *                - SEEK_CUR: 从当前文件指针位置计算偏移。
-         *                - SEEK_END: 从文件末尾计算偏移。
-         * @return 成功返回从文件开头到新位置的偏移量（字节数）；失败返回 -1 并设置 errno。
-         * @note  一个巧妙的用法是：lseek(fd, 0, SEEK_END) 可以直接返回整个文件的大小。
-         */
-        size_t file_size = ::lseek(file_fd, 0, SEEK_END); // 获取文件大小
-        ::lseek(file_fd, 0, SEEK_SET); // 重置文件偏移
 
-        // 把文件任务放到发送队列里，等待 handleWrite() 处理
-        outputQueue_.push(OutputItem(file_fd, file_size));
-        if (outputQueue_.size() == 1) { // 如果之前队列是空的，说明 handleWrite() 没有在工作，需要踢一脚它了
-            handleWrite(); // 直接调用一次 handleWrite()，尝试把文件发送出去，后续如果没发完会自动注册 EPOLLOUT 继续发送
+        // 1. 如果是 SSL 连接，需要加密
+        if (ssl_) {
+            ERR_clear_error();
+            ssize_t n = SSL_write(ssl_, msg.c_str(), msg.size());
+            if (n > 0) {
+                if (static_cast<size_t>(n) < msg.size()) {
+                    writeBuffer_.append(msg.c_str() + n, msg.size() - n);
+                    if (!channel_->isWriting()) {
+                        channel_->enableWriting();
+                    }
+                }
+            } else {
+                savedErrno = SSL_get_error(ssl_, n);
+                if (savedErrno == SSL_ERROR_WANT_WRITE) {
+                    // 情况二：尝试发送加密数据，但是底层缓冲区满了
+                    writeBuffer_.append(msg);
+                    if (!channel_->isWriting()) {
+                        channel_->enableWriting();
+                    }
+                } else if (savedErrno == SSL_ERROR_WANT_READ) {
+                    // 情况四：应用层想要发送数据，但是 OPEN_SSL 发现 TLS 握手还未完成
+                    // 开启可读监听，等待对方发送 TLS 握手数据
+                    writeBuffer_.append(msg);
+                    if (!channel_->isReading()) {
+                        channel_->enableReading();
+                    }
+                    // 重协商完后，需要重新发送数据
+                    if (!channel_->isWriting()) {
+                        channel_->enableWriting();
+                    }
+                } else if (savedErrno == SSL_ERROR_ZERO_RETURN) {
+                    // 对端发送了 TLS "Close Notify" 告警报文，正在有序关闭 SSL 连接
+                    handleClose();
+                } else {
+                    // 出现不可恢复的硬性错误，如（解密失败，证书错误，物理网络断开）
+                    ERR_print_errors_fp(stderr);
+                    handleClose();
+                }
+            }
+        } else {
+            // 输出缓冲区为空，直接发送
+            ssize_t n = ::write(fd_, msg.c_str(), msg.size());
+            bool faltError = false;
+
+            if (n > 0) {
+                if (static_cast<size_t>(n) < msg.size()) {
+                    // 发送了一部分，把剩下的追加到输出缓冲区
+                    writeBuffer_.append(msg.c_str() + n, msg.size() - n);
+                    
+                    if (!channel_->isWriting()) {
+                        channel_->enableWriting();
+                    }
+                }
+            } else {
+                savedErrno = errno;
+                if (savedErrno == EWOULDBLOCK || savedErrno == EAGAIN) {
+                    // 缓存区满了，开启写事件监听
+                    writeBuffer_.append(msg);
+                    if (!channel_->isWriting()) {
+                        channel_->enableWriting();
+                    }
+                } else {
+                    LOG_ERROR << "write 失败! errno=" << savedErrno;
+                    faltError = true;
+                }
+            }
+
+            if (faltError) {
+                handleClose();
+            }
         }
     }
 
     void TcpConnection::handleWrite() {
-        if (state_ != StateE::kConnected) return; // 连接已断开，不再处理写事件
-        auto guard = shared_from_this();
-        while (!outputQueue_.empty()) {
-            OutputItem& item = outputQueue_.front();
-            if (item.is_file) {
-                /**
-                 * @brief 在两个文件描述符之间直接传递数据 (零拷贝核心系统调用)
-                 * @signature ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
-                 * @param out_fd 目标文件描述符，数据将写入此处 (此处为客户端的 TCP 套接字 fd_)
-                 * @param in_fd  源文件描述符，数据将从此处读取 (此处为刚刚打开的本地文件 file_fd)
-                 * @param offset 指向读写偏移量变量的指针。表示从 in_fd 的哪个位置开始读。
-                 *               调用返回时，内核会自动将该变量累加实际发送的字节数！(这完美契合了我们的异步断点续传需求)
-                 * @param count  本次尝试发送的字节数 (传入还剩多少字节没发：file_size - file_offset)
-                 * @return 成功返回实际发送的字节数；如果非阻塞套接字的内核发送缓冲区满了，返回 -1 并自动设置 errno 为 EAGAIN 或 EWOULDBLOCK
-                 * @note 神奇之处：数据从磁盘读到内核页缓存后，直接由网卡 DMA 扒走发送。全程没有跨越内核态去把数据拷贝到你的 C++ 变量里，这就是实现 10 万并发下载的秘密。
-                 */
-                ssize_t bytes_sent = sendfile(fd_, item.file_fd, &item.file_offset, item.file_size - item.file_offset);
-                if (bytes_sent > 0) {
-                    // 检查是否发送完成
-                    if (static_cast<size_t>(bytes_sent) == item.file_size - static_cast<size_t>(item.file_offset)) {
-                        // 文件发送完成，关闭文件描述符并从队列中移除
-                        ::close(item.file_fd);
-                        outputQueue_.pop();
-                    } // 否则，bytes_sent 已经自动累加到 item.file_offset 了，下一轮循环会继续发送剩余部分
-                } else {
-                    if (bytes_sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                        // 内核发送缓冲区满了，暂时无法继续发送，等待下一次可写事件
-                        break;
-                    } else {
-                        LOG_ERROR << "发送文件失败!";
-                        ::close(item.file_fd); // 发生错误也要关闭文件描述符
-                        outputQueue_.pop(); // 从队列中移除这个任务
-                    }
-                }
+        // kHandshaking 时也需要进入（TLS 握手可能需要写入 ClientHello 等报文）
+        if (state_ != StateE::kConnected && state_ != StateE::kHandshaking) return;
+        int savedErrno = 0;
+        ssize_t n = 0;
+        if (writeBuffer_.empty()) {
+            channel_->disableWriting();
+            return;
+        }
+
+        if (ssl_) {
+            ERR_clear_error();
+            n = SSL_write(ssl_, writeBuffer_.peek(), writeBuffer_.readableBytes());
+            if (n > 0) {
+                writeBuffer_.retrieve(n);
             } else {
-                int bytes = ::send(fd_, item.str_data.c_str(), item.str_data.size(), 0);
-                if (bytes > 0) {
-                    // 检查字符串是否被完整发送
-                    if (bytes == static_cast<int>(item.str_data.size())) {
-                        // 字符串发送完成，从队列中移除
-                        outputQueue_.pop();
-                    } else { // 更新 str_data，继续发送剩余部分
-                        item.str_data = item.str_data.substr(bytes);
+                savedErrno = SSL_get_error(ssl_, n);
+                if (savedErrno == SSL_ERROR_WANT_WRITE) {
+                    // 缓存区满了，开启写事件监听
+                    if (!channel_->isWriting()) {
+                        channel_->enableWriting();
+                    }
+                } else if (savedErrno == SSL_ERROR_WANT_READ) {
+                    if (!channel_->isReading()) {
+                        channel_->enableReading();
+                    }
+
+                    if (!channel_->isWriting()) {
+                        channel_->enableWriting();
                     }
                 } else {
-                    if (bytes == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                        // 内核发送缓冲区满了，暂时无法继续发送，等待下一次可写事件
-                        break;
-                    } else {
-                        LOG_ERROR << "发送数据失败!";
-                        outputQueue_.pop(); // 从队列中移除这个任务
+                    // 出现不可恢复的硬性错误，如（解密失败，证书错误，物理网络断开）
+                    ERR_print_errors_fp(stderr);
+                    handleClose();
+                }
+            }
+        } else {
+            n = ::write(fd_, writeBuffer_.peek(), writeBuffer_.readableBytes());
+            if (n > 0) {
+                writeBuffer_.retrieve(n);
+            } else {
+                savedErrno = errno;
+                
+                if (savedErrno == EWOULDBLOCK || savedErrno == EAGAIN) {
+                    // 缓存区满了，开启写事件监听
+                    if (!channel_->isWriting()) {
+                        channel_->enableWriting();
                     }
+                } else {
+                    LOG_ERROR << "write 失败! errno=" << savedErrno;
+                    handleClose();
                 }
             }
         }
 
-        // 如果发送队列已经空了，说明 handleWrite() 的工作完成了，可以暂时休息了，取消对 EPOLLOUT 的监听
-        if (outputQueue_.empty()) {
+        if (writeBuffer_.empty()) {
             channel_->disableWriting();
-        } else { // 说明此时缓冲区还有数据没发完，需要继续监听 EPOLLOUT 事件
-            channel_->enableWriting();
         }
     }
 
@@ -224,7 +354,8 @@ namespace MyServer {
 
     void TcpConnection::handleTimeout() {
         LOG_WARNING << "客户端 fd " << fd_ << " 长时间未发送数据，心跳超时，强制踢出！";
-        if (state_ != StateE::kConnected) return; // 已经在关闭了，不重复处理
+        // kHandshaking 或 kConnected 均可被超时踢出
+        if (state_ == StateE::kDisconnecting || state_ == StateE::kDisconnected) return;
         state_ = StateE::kDisconnecting;
         channel_->disableAll(); // 立即从 epoll 中注销，防止后续事件重入
         // 触发关闭回调，TcpServer 会负责把它从账本里删掉，并销毁堆内存
@@ -235,7 +366,7 @@ namespace MyServer {
     }
 
     void TcpConnection::forceClose() {
-        if (state_ == StateE::kConnected) {
+        if (state_ == StateE::kConnected || state_ == StateE::kHandshaking) {
             auto guard = shared_from_this();
             // 1. 立即修改状态机，防止新的读写事件被调度
             state_ = StateE::kDisconnecting;
@@ -250,6 +381,78 @@ namespace MyServer {
                     closeCallback_(guard);
                 }
             });
+        }
+    }
+
+    void TcpConnection::handleClose() {
+        if (state_ == StateE::kDisconnecting || state_ == StateE::kDisconnected) return;
+
+        state_ = StateE::kDisconnected;
+        channel_->disableAll();
+
+        if (keepAliveTimer_) {
+            keepAliveTimer_->setDeleted();
+        }
+        
+        auto guard = shared_from_this();
+        
+        if (closeCallback_) {
+            closeCallback_(guard);
+        }
+    }
+
+    void TcpConnection::doTlsHandshake() {
+        if (!ssl_) return; // 明文连接不需要握手
+
+        state_ = StateE::kHandshaking;
+
+        ERR_clear_error();
+
+        /**
+         * @brief 发起客户端侧的 TLS 握手
+         * @signature int SSL_connect(SSL *ssl);
+         * @param ssl 已通过 SSL_set_fd() 绑定了底层 socket 的 SSL 会话对象
+         * @details
+         *   [职责]
+         *   SSL_connect() 是 SSL_do_handshake() 的客户端特化版本。
+         *   它执行完整的 TLS 握手流程：
+         *   - 发送 ClientHello → 接收 ServerHello + 证书 → 密钥交换 → 发送 Finished
+         * 
+         *   [非阻塞行为]
+         *   在非阻塞 fd 上，SSL_connect() 通常无法一次性完成整个握手流程，
+         *   因为中间需要等待对端的响应报文通过网络传输过来。此时它会返回 -1，
+         *   通过 SSL_get_error() 可以得到：
+         *   - SSL_ERROR_WANT_READ：需要等对端发来数据（注册 EPOLLIN）
+         *   - SSL_ERROR_WANT_WRITE：需要等发送缓冲区可写（注册 EPOLLOUT）
+         *   后续当 epoll 触发相应事件时，应再次调用 SSL_connect() 继续握手。
+         * 
+         * @return 1 表示握手成功；0 表示握手被对端拒绝；-1 表示需要重试或发生错误。
+         */
+        int ret = SSL_connect(ssl_);
+
+        if (ret == 1) {
+            // 握手成功！切换到正常连接状态
+            state_ = StateE::kConnected;
+            LOG_INFO << "TLS 握手成功 fd=" << fd_;
+        } else {
+            int sslError = SSL_get_error(ssl_, ret);
+
+            if (sslError == SSL_ERROR_WANT_READ) {
+                // 需要等待对端发送握手数据，确保 EPOLLIN 已注册
+                if (!channel_->isReading()) {
+                    channel_->enableReading();
+                }
+            } else if (sslError == SSL_ERROR_WANT_WRITE) {
+                // 需要等待发送缓冲区可写，注册 EPOLLOUT
+                if (!channel_->isWriting()) {
+                    channel_->enableWriting();
+                }
+            } else {
+                // 不可恢复的握手错误
+                ERR_print_errors_fp(stderr);
+                LOG_ERROR << "TLS 握手失败 fd=" << fd_;
+                handleClose();
+            }
         }
     }
 }
