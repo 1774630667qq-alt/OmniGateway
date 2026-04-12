@@ -54,6 +54,7 @@ namespace MyServer {
 
         if (ssl_) { // 密文数据
             char extrabuf[65536]; // 栈上缓冲区，用于接收 SSL 解密后的数据
+            bool gotNewData = false;
             while (true) { // 边缘触发模式下，必须使用 while 循环榨干数据
                 /**
                  * @brief 清空当前线程的 OpenSSL 错误队列
@@ -82,6 +83,7 @@ namespace MyServer {
                 if (readbytes > 0) { // 成功读取到数据
                     buffer_.append(extrabuf, readbytes);
                     extendLife();
+                    gotNewData = true;
                 } else { 
                     /**
                      * @brief 根据 I/O 操作的返回值提取 OpenSSL 具体的错误码
@@ -156,6 +158,9 @@ namespace MyServer {
                         break;
                     }
                 }
+            }
+            if (gotNewData && messageCallback_) {
+                messageCallback_(guard, &buffer_);
             }
         } else { // 明文数据
             /**

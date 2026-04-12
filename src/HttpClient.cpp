@@ -79,6 +79,10 @@ void HttpClient::onConnection(int sockfd) {
      */
     SSL_set_connect_state(ssl);
 
+    // 【关键修复】：设置 SNI (Server Name Indication)
+    // 如果不设置，像 Edge、Cloudflare 或大多数 API 网关会在握手时直接挂起或返回 403/404
+    SSL_set_tlsext_host_name(ssl, apiConfig_.host.c_str());
+
     /**
      * @brief 将 SSL 对象绑定到一个已连通的 socket 文件描述符上
      * @signature int SSL_set_fd(SSL *ssl, int fd);

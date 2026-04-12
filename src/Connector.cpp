@@ -152,7 +152,7 @@ void Connector::retry(int sockfd, int savedErrno) {
 }
 
 void Connector::handleWrite() {
-    if (state_ != kConnecting)
+    if (state_ != kConnecting || !channel_)
       return;
 
     // 先提取 fd，然后彻底释放 Channel 的所有权
@@ -160,7 +160,11 @@ void Connector::handleWrite() {
     int sockfd = channel_->getFd();
     channel_->disableAll();
     channel_->remove();
-    channel_.reset();
+    // 延迟销毁 channel_，防止在 Channel::handleEvent 尚未结束时销毁自身 (导致 core dump)
+    Channel* ch = channel_.release();
+    loop_->queueInLoop([ch]() {
+        delete ch;
+    });
 
     // 通过 getsockopt 验证非阻塞 connect 是否真正成功
     int err = 0;
@@ -184,14 +188,18 @@ void Connector::handleWrite() {
 }
 
 void Connector::handleError() {
-    if (state_ != kConnecting)
+    if (state_ != kConnecting || !channel_)
       return;
 
     // 先提取 fd 和错误信息，然后释放 Channel
     int sockfd = channel_->getFd();
     channel_->disableAll();
     channel_->remove();
-    channel_.reset();
+    // 延迟销毁 channel_，防止在 Channel::handleEvent 尚未结束时销毁自身
+    Channel* ch = channel_.release();
+    loop_->queueInLoop([ch]() {
+        delete ch;
+    });
 
     int err = 0;
     socklen_t errLen = sizeof(err);

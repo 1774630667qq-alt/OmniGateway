@@ -2,107 +2,79 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-04-04 16:15:45
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-09 16:25:07
+ * @LastEditTime: 2026-04-12 21:58:14
  * @FilePath: /OmniGateway/src/main.cpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
  * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
 #include "EventLoop.hpp"
-#include "HttpServer.hpp"
-#include "HttpRequest.hpp"
-#include "HttpResponse.hpp"
-#include "ThreadPool.hpp"
-#include "Logger.hpp"
-#include "json.hpp"
-#include <string>
-#include <signal.h>
+#include "HttpClient.hpp"
 #include "SSLManager.hpp"
+#include "Logger.hpp"
+#include <iostream>
+#include <signal.h>
 
 using namespace MyServer;
-using json = nlohmann::json;
-
-// 你亲手写的核心翻译官
-std::string translateAnthropicToOpenAI(const std::string& anthropic_str, 
-                                    const std::string& target_model) {
-    try {
-        json anthropic_json = json::parse(anthropic_str);
-        json openai_json;
-        openai_json["model"] = target_model;
-        openai_json["messages"] = json::array();
-        
-        if (anthropic_json.contains("system")) {
-            openai_json["messages"].push_back({
-                {"role", "system"},
-                {"content", anthropic_json["system"]}
-            });
-        }
-        
-        if (anthropic_json.contains("messages")) {
-            for (const auto& msg : anthropic_json["messages"]) {
-                openai_json["messages"].push_back(msg);
-            }
-        }
-        
-        if (anthropic_json.contains("temperature")) {
-            openai_json["temperature"] = anthropic_json["temperature"];
-        }
-        
-        return openai_json.dump(); // 实际网络传输，不要空格，极致压缩！
-    } catch (const std::exception& e) {
-        LOG_ERROR << "JSON 解析/转换失败: " << e.what();
-        return ""; // 如果传过来的不是合法 JSON，防崩溃
-    }
-}
 
 int main() {
+    // 1. 忽略 SIGPIPE 信号，防止连接异常断开导致进程直接崩溃退出
+    signal(SIGPIPE, SIG_IGN);
+
+    // 2. 正确调用全局日志初始化函数
+    MyServer::initGlobalLogger("SmokeTestLog");
+
+    // 3. 正确初始化 OpenSSL 环境
     SSLManager::init();
-    signal(SIGPIPE, SIG_IGN); // 忽略断开信号，防崩溃
-    MyServer::initGlobalLogger("OmniGatewayLog");
 
     EventLoop loop;
-    ThreadPool pool(4); // 网关主要做 IO 转发，工作线程不需要太多，4 个足矣
 
-    // 在 8080 端口启动我们的代理网关
-    HttpServer gateway_server(&loop, 8080, &pool);
-    gateway_server.setThreadNum(2); 
+    // 4. 配置大模型 API 参数
+    ApiConfig config;
+    config.host = "api.edgefn.net"; 
+    config.path = "/v1/chat/completions";
+    config.apiKey = "sk-xxx"; // 【务必修改】填入你的真实鉴权密钥
+    config.targetModel = "GLM-5"; 
 
-    gateway_server.setHttpCallback([](const HttpRequest& req, HttpResponse& res) {
-        LOG_INFO << "收到来自客户端的请求: " << req.getMethod() << " " << req.getPath();
+    // 5. 目标地址
+    // 注意：如果你的 InetAddress 还没实现 DNS 解析，请先 ping api.edgefn.net 
+    // 获取真实 IP（例如 "114.114.x.x"），然后填在这里。
+    InetAddress serverAddr(443, "198.18.0.87"); 
 
-        // 拦截 Claude Code 发往 Anthropic 官方的默认接口地址：/v1/messages
-        if (req.getPath() == "/v1/messages" && req.getMethod() == "POST") {
-            
-            // 1. 从 HTTP 请求体中掏出 Claude 给我们的原始数据
-            std::string claude_body = req.getBody();
-            LOG_INFO << "接收到 Claude 的数据，长度: " << claude_body.size() << " bytes";
+    // 6. 实例化 HttpClient
+    std::shared_ptr<HttpClient> client = std::make_shared<HttpClient>(&loop, serverAddr, config);
 
-            // 2. 调用翻译引擎 (目标设为白山智算的 GLM-5)
-            std::string openai_body = translateAnthropicToOpenAI(claude_body, "GLM-5");
-
-            if (openai_body.empty()) {
-                res.setStatusCode(400, "Bad Request");
-                res.setBody("{\"error\": \"Invalid JSON Format\"}");
-                res.addHeader("Content-Type", "application/json");
-                return;
-            }
-
-            // 3. (暂不发往白山智算) 我们先把翻译好的数据直接作为 HTTP 响应返回，方便调试！
-            res.setStatusCode(200, "OK");
-            res.addHeader("Content-Type", "application/json");
-            res.setBody(openai_body);
-            
-            LOG_INFO << "成功完成协议翻译并返回响应！";
-        } 
-        else {
-            // 对付那些乱请求的路径
-            res.setStatusCode(404, "Not Found");
-            res.setBody("OmniGateway: Path not supported yet.");
-        }
+    // 7. 挂载响应回调：直接在控制台打印状态机切割出的纯净 SSE 碎片
+    client->setResponseCallback([](const std::string& data) {
+        std::cout << "\n\033[32m[完美切割的 SSE 事件]\033[0m\n";
+        std::cout << data << std::endl;
     });
 
-    LOG_INFO << "OmniGateway 引擎启动成功！正在监听 8080 端口...";
-    gateway_server.start();
+    // 8. 发起异步连接 (非阻塞)
+    client->connect();
+
+    // 9. 延迟发送请求 (模拟 ConnectionCallback)
+    // 这里的延时用于等待底层 TCP 和 TLS 握手彻底完成。
+    // 【注意】：如果你的 runAfter 接收的是秒（double），请写 2.0；如果是毫秒（int），请写 2000。
+    loop.runAfter(2.0, [client, config]() {
+        LOG_INFO << "========= 延时结束，开始发射 HTTP 报文 =========";
+        
+        // 构造一个标准的 OpenAI 格式的测试 JSON
+        std::string testJson = 
+            "{\n"
+            "  \"model\": \"" + config.targetModel + "\",\n"
+            "  \"messages\": [{\"role\": \"user\", \"content\": \"你好，请用10个字以内介绍你自己。\"}],\n"
+            "  \"stream\": true\n"
+            "}";
+        client->setRequestBody(testJson);
+    });
+
+    LOG_INFO << "冒烟测试程序启动，正在连接大模型 API...";
+    
+    // 10. 开启事件循环，驱动底层网络状态机
     loop.loop();
+
+    // 11. 清理 SSL 资源
     SSLManager::destroy();
+
     return 0;
 }
