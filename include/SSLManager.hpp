@@ -149,6 +149,6 @@ private:
      * @note 需在析构函数中调用 SSL_CTX_free(sslCtx_) 释放资源
      * @see SSL_CTX_new(), SSL_CTX_use_certificate_file(), SSL_CTX_use_PrivateKey_file()
      */
-    static SSL_CTX *serverCtx_;
-    static SSL_CTX *clientCtx_;
+    static inline SSL_CTX *serverCtx_;
+    static inline SSL_CTX *clientCtx_;
 };

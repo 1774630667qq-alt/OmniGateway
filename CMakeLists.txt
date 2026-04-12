@@ -23,8 +23,11 @@ list(REMOVE_ITEM SOURCES "${PROJECT_SOURCE_DIR}/src/epollimpl.cpp")
 # 编译为可执行文件
 add_executable(OmniGateway ${SOURCES})
 
-# 链接多线程库
-target_link_libraries(OmniGateway PRIVATE Threads::Threads)
+# 查找 OpenSSL 库
+find_package(OpenSSL REQUIRED)
+
+# 链接多线程库和 OpenSSL
+target_link_libraries(OmniGateway PRIVATE Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
 
 # 将项目根目录路径注入为编译期宏，供 SSL 证书等资源定位使用
 target_compile_definitions(OmniGateway PRIVATE PROJECT_ROOT="${PROJECT_SOURCE_DIR}")

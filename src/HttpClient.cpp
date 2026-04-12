@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-04-08 15:56:09
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-11 19:19:55
+ * @LastEditTime: 2026-04-12 14:48:20
  * @FilePath: /OmniGateway/src/HttpClient.cpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
  * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
@@ -17,10 +17,17 @@
 namespace MyServer {
 HttpClient::HttpClient(EventLoop* loop, const InetAddress& serverAddr, const ApiConfig& apiConfig)
     : loop_(loop),
-      connector_(std::make_shared<Connector>(loop, serverAddr)),
-      apiConfig_(apiConfig),
-      connected_(false) {
+    connector_(std::make_shared<Connector>(loop, serverAddr)),
+    apiConfig_(apiConfig),
+    connected_(false) {
     
+}
+
+HttpClient::~HttpClient() {
+    if (connected_ && backendConn_) {
+        backendConn_->forceClose();
+        backendConn_.reset();
+    }
 }
 
 void HttpClient::connect() {
@@ -53,6 +60,23 @@ void HttpClient::onConnection(int sockfd) {
         ::close(sockfd);
         return;
     }
+
+    /**
+     * @brief 显式将 SSL 对象设置为客户端模式（主动发起握手方）
+     * @signature void SSL_set_connect_state(SSL *ssl);
+     * @param ssl 目标 SSL 会话对象
+     * @details
+     *   [职责]
+     *   标记该 SSL 对象在后续握手中扮演"客户端"角色（即发送 ClientHello 的一方）。
+     *   与之对应的 SSL_set_accept_state() 则将 SSL 对象设置为服务端模式。
+     * 
+     *   [在本项目中是否必要？]
+     *   严格来说是冗余的，原因：
+     *   1. SSL 对象由 TLS_client_method() 创建的 clientCtx_ 派生，默认已是客户端模式。
+     *   2. 后续调用的 SSL_connect() 内部也会隐式调用 SSL_set_connect_state()。
+     *   此处显式调用作为防御性编程，明确表达"这是一条客户端连接"的设计意图。
+     */
+    SSL_set_connect_state(ssl);
 
     /**
      * @brief 将 SSL 对象绑定到一个已连通的 socket 文件描述符上
@@ -125,7 +149,24 @@ void HttpClient::onMessage(const std::shared_ptr<TcpConnection>& conn, Buffer* b
     
 }
 
-void HttpClient::sendRequest(const std::string& request) {
-    
+void HttpClient::sendRequest(const std::string& requestBody) {
+    if (!connected_ || !backendConn_) {
+        LOG_ERROR << "HttpClient::sendRequest: 未连接到后端 API";
+        return;
+    }
+
+    std::string httpPacket;
+    // 拼写请求行
+    httpPacket += "POST " + apiConfig_.path + " HTTP/1.1\r\n";
+    // 拼写请求头
+    httpPacket += "Host: " + apiConfig_.host + "\r\n";
+    httpPacket += "Content-Type: application/json\r\n";
+    httpPacket += "Authorization: Bearer " + apiConfig_.apiKey + "\r\n";
+    httpPacket += "Content-Length: " + std::to_string(requestBody.size()) + "\r\n";
+    httpPacket += "\r\n";
+    // 拼接请求体
+    httpPacket += requestBody;
+    // 发送HTTP请求
+    backendConn_->send(httpPacket);
 }
 }// namespace MyServer

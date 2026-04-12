@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-04-08 15:56:09
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-11 19:20:42
+ * @LastEditTime: 2026-04-11 22:22:08
  * @FilePath: /OmniGateway/include/HttpClient.hpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
  * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
@@ -10,6 +10,7 @@
 #include "EventLoop.hpp"
 #include "TcpConnection.hpp"
 #include "Connector.hpp"
+#include "HttpParser.hpp"
 
 namespace MyServer {
 
@@ -71,9 +72,7 @@ public:
     HttpClient(EventLoop* loop, const InetAddress& serverAddr, const ApiConfig& apiConfig);
 
     /**
-     * @brief 析构函数：释放客户端资源
-     * @details 销毁时若仍持有活跃的 backendConn_，需确保连接已被正确关闭，
-     *   避免文件描述符泄漏。（待实现）
+     * @brief 析构函数：释放客户端资源并执行安全清理
      */
     ~HttpClient();
 
@@ -83,7 +82,19 @@ public:
      */
     void connect();
 
-    void sendRequest(const std::string& requestStr);
+    /**
+     * @brief 组装并发送完整的 HTTP POST 请求
+     * @signature void sendRequest(const std::string& requestBody);
+     * @param requestBody 已经转换好的 OpenAI 格式的 JSON 字符串
+     * @details
+     * [职责]
+     * 纯粹的 JSON 字符串无法直接发给大模型 API，必须被包装成合法的 HTTP 报文。
+     * 该方法负责手工拼接 HTTP 请求行（POST /v1/...）、请求头（Host, Content-Type, Authorization, Content-Length）
+     * 以及空行（\r\n），最后附上 requestBody，统一发往底层的 backendConn_。
+     * * [前置条件]
+     * 调用此方法前，必须确保 connected_ 为 true 且 TLS 握手已成功完成。
+     */
+    void sendRequest(const std::string& requestBody);
 
     /**
      * @brief 设置响应回调函数
@@ -116,6 +127,24 @@ private:
 
     void onClose(const std::shared_ptr<TcpConnection>& conn);
 
+    /**
+     * @brief HTTP 响应体解析状态机枚举
+     * @details 头部解析阶段已委托给 HttpParser（响应模式），
+     *   此枚举仅管理头部解析完成后的 Chunked 数据处理流程。
+     */
+    enum ParseState {
+        kExpectChunkSize,  ///< 正在解析 Chunked 块的十六进制长度行
+        kExpectChunkData,  ///< 正在读取真实的 Chunk 数据
+        kExpectErrorBody   ///< 正在读取非 200 响应的错误 JSON 实体
+    };
+
+    /// 通用 HTTP 响应解析器（响应模式），负责解析状态行和头部
+    HttpParser httpParser_{HttpParser::ParserMode::kResponseMode};
+    ParseState parseState_ = kExpectChunkSize; ///< 当前体解析状态（头部由 httpParser_ 管理）
+    size_t currentChunkSize_ = 0;              ///< 当前 Chunk 块剩余需要读取的字节数
+    size_t expectedErrorLength_ = 0;           ///< 非 200 错误响应的 Content-Length
+    Buffer chunkedBuffer_;                     ///< 专用缓冲区：存放剥离十六进制长度后的纯净数据
+
     EventLoop* loop_;                                ///< 所绑定的事件循环（IO 线程）
     std::shared_ptr<Connector> connector_;           ///< 主动连接器：负责非阻塞 TCP 三次握手
     std::shared_ptr<TcpConnection> backendConn_;     ///< 与后端 API 的活跃 TCP 连接（握手成功后创建）
@@ -123,6 +152,7 @@ private:
     
     HttpResponseCallback responseCallback_;          ///< 跨线程桥梁：将后端响应回传至前端 HttpServer
     
-    bool connected_;                                 ///< 当前是否与后端 API 处于已连接状态
+    bool connected_ = false;                         ///< 当前是否与后端 API 处于已连接状态
+    bool headersParsed_ = false;                     ///< 头部是否已被 HttpParser 解析完毕
 };
 } // namespace MyServer
