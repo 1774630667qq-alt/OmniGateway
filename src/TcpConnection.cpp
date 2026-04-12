@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-03-20 15:29:51
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-11 15:19:05
+ * @LastEditTime: 2026-04-12 15:18:11
  * @FilePath: /ServerPractice/src/TcpConnection.cpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -41,9 +41,14 @@ namespace MyServer {
     }
 
     void TcpConnection::handleRead() {
+        if (state_ == StateE::kHandshaking) {
+            doTlsHandshake();
+            return;
+        }
+
         int savedErrno = 0;
         // kHandshaking 时也需要进入（TLS 握手可能需要读取对端报文）
-        if (state_ != StateE::kConnected && state_ != StateE::kHandshaking) return;
+        if (state_ != StateE::kConnected) return;
         // 使用智能指针守卫，防止在回调过程中自己被析构导致崩溃
         auto guard = shared_from_this();
 
@@ -273,8 +278,13 @@ namespace MyServer {
     }
 
     void TcpConnection::handleWrite() {
+        if (state_ == StateE::kHandshaking) {
+            doTlsHandshake();
+            return;
+        }
+
         // kHandshaking 时也需要进入（TLS 握手可能需要写入 ClientHello 等报文）
-        if (state_ != StateE::kConnected && state_ != StateE::kHandshaking) return;
+        if (state_ != StateE::kConnected) return;
         int savedErrno = 0;
         ssize_t n = 0;
         if (writeBuffer_.empty()) {
@@ -433,6 +443,9 @@ namespace MyServer {
         if (ret == 1) {
             // 握手成功！切换到正常连接状态
             state_ = StateE::kConnected;
+            if (connectionCallback_) {
+                connectionCallback_(shared_from_this());
+            }
             LOG_INFO << "TLS 握手成功 fd=" << fd_;
         } else {
             int sslError = SSL_get_error(ssl_, ret);

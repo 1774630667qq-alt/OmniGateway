@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-03-26 17:07:45
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-12 14:52:00
+ * @LastEditTime: 2026-04-12 15:02:34
  * @FilePath: /OmniGateway/include/HttpParser.hpp
  * @Description: 通用 HTTP 协议解析器，支持请求模式和响应模式
  */
@@ -81,7 +81,7 @@ public:
     // ====================== 静态解析接口（向后兼容）======================
 
     /**
-     * @brief 静态解析入口：一次性解析完整的 HTTP 请求头部字符串（向后兼容 HttpServer）
+     * @brief 静态解析入口：一次性解析完整的 HTTP 请求头部字符串
      * @signature static bool parse(const std::string& raw_msg, HttpRequest* request);
      * @param raw_msg 底层传来的包含 \r\n\r\n 的完整头部字符串
      * @param request 要被填充的请求对象指针

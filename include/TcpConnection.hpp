@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-03-20 15:29:42
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-11 19:05:16
+ * @LastEditTime: 2026-04-12 15:17:01
  * @FilePath: /ServerPractice/include/TcpConnection.hpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -38,6 +38,8 @@ enum StateE {
  * * 然后把读到的数据通过回调函数 (messageCallback_) 汇报给大老板 (TcpServer)。
  */
 class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
+public:
+    using ConnectionCallBack = std::function<void(const std::shared_ptr<TcpConnection>&)>;
 private:
     EventLoop* loop_;       ///< 大管家 (所属的事件循环)
     SSL* ssl_;              ///< SSL 对象
@@ -56,6 +58,9 @@ private:
     
     ///< 当客人断开连接时，触发此回调。参数是当前连接的智能指针
     std::function<void(const std::shared_ptr<TcpConnection>&)> closeCallback_;
+
+    ///< 当连接建立时，触发此回调。参数是当前连接的智能指针
+    ConnectionCallBack connectionCallback_;
 
     /**
      * @brief 定时器引爆时执行的踢人函数
@@ -102,6 +107,9 @@ public:
     }
     void setCloseCallback(std::function<void(const std::shared_ptr<TcpConnection>&)> cb) {
         closeCallback_ = std::move(cb);
+    }
+    void setConnectionCallback(ConnectionCallBack cb) {
+        connectionCallback_ = std::move(cb);
     }
 
     /**

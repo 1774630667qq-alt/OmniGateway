@@ -44,10 +44,12 @@ struct ApiConfig {
  * 
  *   [生命周期]
  *   1. 构造阶段：接收 EventLoop、目标地址和 API 配置，内部创建 Connector 但不立即发起连接。
- *   2. 连接阶段：调用 connect() 后，Connector 在 IO 线程中以非阻塞方式发起 TCP 三次握手。
- *   3. TLS 握手：TCP 连通后，由 TcpConnection::doTlsHandshake() 完成 SSL 加密通道建立。
- *   4. 数据交互：握手完成后，通过 sendRequest() 发送 HTTP 请求，onMessage() 接收后端响应。
- *   5. 销毁阶段：连接断开或出错时，onClose() 被触发，清理 TcpConnection 资源。
+ *   2. 准备阶段：外部调用 setRequestBody() 存入待发送的 JSON，setResponseCallback() 注册回调。
+ *   3. 连接阶段：调用 connect() 后，Connector 在 IO 线程中以非阻塞方式发起 TCP 三次握手。
+ *   4. TLS 握手：TCP 连通后，由 TcpConnection::doTlsHandshake() 完成 SSL 加密通道建立。
+ *   5. 自动发送：握手成功触发 connectionCallback_，内部自动调用 sendRequest() 发出 HTTP 报文。
+ *   6. 数据交互：onMessage() 接收并解析后端响应，通过 responseCallback_ 回传给前端。
+ *   7. 销毁阶段：连接断开或出错时，onClose() 被触发，清理 TcpConnection 资源。
  * 
  *   [线程模型]
  *   HttpClient 绑定到指定的 EventLoop 线程上运行。所有的网络事件回调
@@ -83,18 +85,24 @@ public:
     void connect();
 
     /**
-     * @brief 组装并发送完整的 HTTP POST 请求
-     * @signature void sendRequest(const std::string& requestBody);
-     * @param requestBody 已经转换好的 OpenAI 格式的 JSON 字符串
+     * @brief 存入待发送的 JSON 请求体
+     * @signature void setRequestBody(const std::string& body);
+     * @param body 已经转换好的 OpenAI 格式的 JSON 字符串
      * @details
-     * [职责]
-     * 纯粹的 JSON 字符串无法直接发给大模型 API，必须被包装成合法的 HTTP 报文。
-     * 该方法负责手工拼接 HTTP 请求行（POST /v1/...）、请求头（Host, Content-Type, Authorization, Content-Length）
-     * 以及空行（\r\n），最后附上 requestBody，统一发往底层的 backendConn_。
-     * * [前置条件]
-     * 调用此方法前，必须确保 connected_ 为 true 且 TLS 握手已成功完成。
+     *   [职责]
+     *   将待发送数据暂存到 pendingRequestBody_ 中。
+     *   外部调用 connect() 后，当 TCP + TLS 握手全部完成时，
+     *   HttpClient 内部会自动调用 sendRequest() 将该数据组装为 HTTP 报文发出。
+     * 
+     *   [典型调用顺序]
+     *   1. client->setRequestBody(jsonStr);  // 存入数据
+     *   2. client->setResponseCallback(cb);  // 注册回调
+     *   3. client->connect();                // 启动连接
+     *   后续全自动：TCP 连接 → TLS 握手 → sendRequest → onMessage
      */
-    void sendRequest(const std::string& requestBody);
+    void setRequestBody(const std::string& body) {
+        pendingRequestBody_ = body;
+    }
 
     /**
      * @brief 设置响应回调函数
@@ -128,6 +136,19 @@ private:
     void onClose(const std::shared_ptr<TcpConnection>& conn);
 
     /**
+     * @brief 组装并发送完整的 HTTP POST 请求（内部方法）
+     * @signature void sendRequest();
+     * @details
+     *   [职责]
+     *   将 pendingRequestBody_ 中暂存的 JSON 包装成合法的 HTTP 报文
+     *   （请求行 + 请求头 + 空行 + 请求体），通过 backendConn_->send() 发出。
+     * 
+     *   [调用时机]
+     *   由 connectionCallback_ 在 TLS 握手成功后自动触发，外部不应直接调用。
+     */
+    void sendRequest();
+
+    /**
      * @brief HTTP 响应体解析状态机枚举
      * @details 头部解析阶段已委托给 HttpParser（响应模式），
      *   此枚举仅管理头部解析完成后的 Chunked 数据处理流程。
@@ -154,5 +175,6 @@ private:
     
     bool connected_ = false;                         ///< 当前是否与后端 API 处于已连接状态
     bool headersParsed_ = false;                     ///< 头部是否已被 HttpParser 解析完毕
+    std::string pendingRequestBody_;                 ///< 暂存待发送的 JSON 请求体（connect 前存入，握手后自动发送）
 };
 } // namespace MyServer

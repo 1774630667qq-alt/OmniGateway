@@ -130,6 +130,12 @@ void HttpClient::onConnection(int sockfd) {
             onClose(conn);
         }
     );
+    // 注册连接回调：TLS 握手成功后自动将暂存的请求发出
+    conn->setConnectionCallback(
+        [this] (const std::shared_ptr<TcpConnection>&) {
+            sendRequest();
+        }
+    );
 
     backendConn_ = conn;
     connected_ = true;
@@ -149,24 +155,31 @@ void HttpClient::onMessage(const std::shared_ptr<TcpConnection>& conn, Buffer* b
     
 }
 
-void HttpClient::sendRequest(const std::string& requestBody) {
+void HttpClient::sendRequest() {
     if (!connected_ || !backendConn_) {
         LOG_ERROR << "HttpClient::sendRequest: 未连接到后端 API";
         return;
     }
 
+    if (pendingRequestBody_.empty()) {
+        LOG_WARNING << "HttpClient::sendRequest: 没有待发送的请求体";
+        return;
+    }
+
     std::string httpPacket;
-    // 拼写请求行
+    // 拼接请求行
     httpPacket += "POST " + apiConfig_.path + " HTTP/1.1\r\n";
-    // 拼写请求头
+    // 拼接请求头
     httpPacket += "Host: " + apiConfig_.host + "\r\n";
     httpPacket += "Content-Type: application/json\r\n";
     httpPacket += "Authorization: Bearer " + apiConfig_.apiKey + "\r\n";
-    httpPacket += "Content-Length: " + std::to_string(requestBody.size()) + "\r\n";
+    httpPacket += "Content-Length: " + std::to_string(pendingRequestBody_.size()) + "\r\n";
     httpPacket += "\r\n";
     // 拼接请求体
-    httpPacket += requestBody;
-    // 发送HTTP请求
+    httpPacket += pendingRequestBody_;
+    // 发送 HTTP 请求
     backendConn_->send(httpPacket);
+
+    LOG_INFO << "HTTP 请求已发送至后端 API: " << apiConfig_.host << apiConfig_.path;
 }
 }// namespace MyServer
