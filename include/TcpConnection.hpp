@@ -39,6 +39,7 @@ enum StateE {
  */
 class TcpConnection : public std::enable_shared_from_this<TcpConnection> {
 public:
+    /// 连接建立回调类型：TLS 握手成功后触发，参数为当前连接的智能指针
     using ConnectionCallBack = std::function<void(const std::shared_ptr<TcpConnection>&)>;
 private:
     EventLoop* loop_;       ///< 大管家 (所属的事件循环)
@@ -59,7 +60,7 @@ private:
     ///< 当客人断开连接时，触发此回调。参数是当前连接的智能指针
     std::function<void(const std::shared_ptr<TcpConnection>&)> closeCallback_;
 
-    ///< 当连接建立时，触发此回调。参数是当前连接的智能指针
+    ///< 当连接完全建立时（明文直接连上，或 TLS 握手成功后）触发此回调
     ConnectionCallBack connectionCallback_;
 
     /**
@@ -76,6 +77,7 @@ public:
      * @brief 构造函数：接管客户端文件描述符，并初始化其专属 Channel
      * @param loop 所在的 EventLoop 实例
      * @param fd 客户端已连接的非阻塞套接字文件描述符
+     * @param ssl 可选的 SSL 会话对象指针，若为 nullptr 则为明文连接，否则为加密连接
      */
     TcpConnection(EventLoop* loop, int fd, SSL* ssl = nullptr);
     

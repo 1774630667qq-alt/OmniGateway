@@ -117,22 +117,42 @@ public:
 
 private:
     /**
-     * @brief Connector 连接成功后的交接回调（待实现）
+     * @brief Connector 连接成功后的交接回调
      * @signature void onConnection(int sockfd);
      * @param sockfd Connector 成功建立 TCP 连接后移交的已连通套接字文件描述符
      * @details
-     *   [设计契约]
-     *   实现时应当完成以下工作：
-     *   1. 基于 sockfd 创建 TcpConnection 对象（存入 backendConn_）。
-     *   2. 为 backendConn_ 注册 onMessage 和 onClose 回调。
-     *   3. 调用 backendConn_->connectEstablished() 将 fd 注册进 epoll 监听。
-     *   4. 更新 connected_ 状态为 true。
-     *   此回调标志着从"修路阶段"进入"通车阶段"。
+     *   [当前实现]
+     *   1. 创建 SSL 对象并通过 SSL_set_fd() 绑定到 sockfd。
+     *   2. 基于 sockfd 创建 TcpConnection（存入 backendConn_）。
+     *   3. 注册 onMessage、onClose、connectionCallback_ 回调。
+     *   4. 在 IO 线程中调用 connectEstablished() + doTlsHandshake()。
      */
     void onConnection(int sockfd);
 
+    /**
+     * @brief 后端 API 返回数据时的读事件回调
+     * @signature void onMessage(const std::shared_ptr<TcpConnection>& conn, Buffer* buf);
+     * @param conn 与后端 API 通信的 TcpConnection 智能指针
+     * @param buf 读缓冲区指针，包含从后端接收到的原始 HTTP 响应数据
+     * @details
+     *   [当前实现]
+     *   分三个阶段处理：
+     *   1. 头部解析：委托 httpParser_ 解析状态行和头部，提取状态码和 Transfer-Encoding。
+     *   2. 错误实体：若状态码非 200，收集完整错误 JSON 后通过 responseCallback_ 回传。
+     *   3. Chunked + SSE：解析十六进制长度 → 提取原始数据 → 按 "\n\n" 切割 SSE 事件 → 回传前端。
+     */
     void onMessage(const std::shared_ptr<TcpConnection>& conn, Buffer* buf);
 
+    /**
+     * @brief 后端连接关闭时的回调
+     * @signature void onClose(const std::shared_ptr<TcpConnection>& conn);
+     * @param conn 即将关闭的与后端 API 的 TcpConnection 智能指针
+     * @details
+     *   [当前实现]
+     *   1. 更新 connected_ 状态，释放 backendConn_ 强引用。
+     *   2. 异常熔断通知：若网络突然断开，通过 responseCallback_
+     *      发送一个内部错误信号，防止前端死等。
+     */
     void onClose(const std::shared_ptr<TcpConnection>& conn);
 
     /**

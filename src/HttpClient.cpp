@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-04-08 15:56:09
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-12 14:48:20
+ * @LastEditTime: 2026-04-12 16:54:54
  * @FilePath: /OmniGateway/src/HttpClient.cpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
  * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
@@ -13,6 +13,7 @@
 #include <unistd.h>
 #include "SSLManager.hpp"
 #include "Logger.hpp"
+#include "HttpParser.hpp"
 
 namespace MyServer {
 HttpClient::HttpClient(EventLoop* loop, const InetAddress& serverAddr, const ApiConfig& apiConfig)
@@ -147,14 +148,158 @@ void HttpClient::onConnection(int sockfd) {
     });
 }
 
+/**
+ * @brief 后端连接物理关闭时的回调
+ * @details 释放 backendConn_ 引用，并通过 responseCallback_ 发送异常熔断信号，
+ *   防止前端在网络突然中断时无限等待。
+ */
 void HttpClient::onClose(const std::shared_ptr<TcpConnection>& conn) {
+    LOG_INFO << "HttpClient::onClose 触发: 与后端 API (" 
+             << apiConfig_.host << ") 的连接已物理断开";
     
+    connected_ = false;
+
+    // 1. 释放对 TcpConnection 的强引用，允许其安全析构
+    if (backendConn_ && backendConn_ == conn) {
+        backendConn_.reset();
+    }
+
+    // 2. 异常熔断通知（防死锁兜底机制）
+    // 如果大模型正常发完，最后一条通常是 data: [DONE]\n\n，前端收到就会自动结束。
+    // 但如果网络突然断了，我们最好通过回调给前端发一个伪造的异常断开信号，防止前端死等。
+    if (responseCallback_) {
+        // 构建一个特定的内部信号，供上层（网关转发层）识别并处理
+        // 注意：这里可以根据你实际的 JSON 结构约定一个内部的错误格式
+        std::string errorSignal = "data: {\"error\": \"Gateway backend connection closed unexpectedly\"}\n\n";
+        responseCallback_(errorSignal);
+        
+        // 可选：为了彻底安全，你还可以追加发送一个 [DONE] 让前端死心
+        // responseCallback_("data: [DONE]\n\n");
+    }
 }
 
+/**
+ * @brief 后端 API 返回数据时的核心解析入口
+ * @details 采用三阶段流水线处理：
+ *   阶段一：委托 httpParser_ 解析响应状态行和头部
+ *   阶段二：若状态码非 200，收集完整错误实体后回传
+ *   阶段三：Chunked 脱壳 → SSE 事件切割 → 逐条回传前端
+ */
 void HttpClient::onMessage(const std::shared_ptr<TcpConnection>& conn, Buffer* buf) {
     
+    // ================= 阶段一：解析 HTTP 头部 =================
+    if (!headersParsed_) {
+        bool ok = httpParser_.parse(buf);
+        if (!ok) {
+            LOG_ERROR << "HTTP 响应头解析失败";
+            conn->forceClose();
+            return;
+        }
+
+        // 【关键防御】：如果头部还没收到 \r\n\r\n，立刻交出控制权，杜绝死等
+        if (!httpParser_.gotAll()) {
+            return; 
+        }
+
+        // 头部彻底解析完成，开始提取核心参数
+        headersParsed_ = true;
+        int code = httpParser_.statusCode();
+
+        if (code == 200) {
+            if (httpParser_.getHeader("Transfer-Encoding") == "chunked") {
+                parseState_ = ParseState::kExpectChunkSize; // 跃迁至脱壳阶段
+            } else {
+                LOG_ERROR << "未收到 chunked 编码，不支持处理该流";
+                conn->forceClose();
+                return;
+            }
+        } else {
+            // 非 200 状态码，跃迁至接收错误实体阶段
+            parseState_ = ParseState::kExpectErrorBody;
+            std::string context_len = httpParser_.getHeader("Content-Length");
+            if (!context_len.empty()) {
+                // 使用 stoull 防止大文件引发的溢出异常
+                expectedErrorLength_ = std::stoull(context_len);
+            } else {
+                LOG_WARNING << "非 200 响应缺失 Content-Length，强制断开";
+                conn->forceClose();
+                return;
+            }
+        }
+    }
+
+    // ================= 阶段二：处理异常状态码的完整实体 =================
+    if (parseState_ == ParseState::kExpectErrorBody) {
+        // 【核心机制】：如果积压的数据够了，才提取并断开
+        if (buf->readableBytes() >= expectedErrorLength_) {
+            std::string errorBody = buf->retrieveAsString(expectedErrorLength_);
+            if (responseCallback_) {
+                responseCallback_(errorBody);
+            }
+            LOG_ERROR << "HttpClient 接收到报错:\n" << errorBody;
+            conn->forceClose(); // 错误收集完毕，物理断开连接
+        }
+        return; 
+    }
+
+    // ================= 阶段三：处理 Chunked 和 SSE 报文 =================
+    while (parseState_ == ParseState::kExpectChunkSize || parseState_ == ParseState::kExpectChunkData) {
+        if (parseState_ == ParseState::kExpectChunkSize) {
+            size_t crlfPos = buf->findCRLF(std::string_view("\r\n", 2));
+            if (crlfPos == std::string::npos) {
+                return;
+            }
+            std::string hexStr(buf->peek(), crlfPos);
+            try {
+                currentChunkSize_ = std::stoull(hexStr, nullptr, 16);
+            } catch (const std::exception& e) {
+                LOG_ERROR << "HttpClient::onMessage: 解析 chunk 大小失败: " << e.what();
+                conn->forceClose();
+                return;
+            }
+            buf->retrieve(crlfPos + 2);
+
+            if (currentChunkSize_ == 0) {
+                LOG_INFO << "大模型API响应结束, 物理断开连接";
+                conn->forceClose();
+                return;
+            }
+
+            parseState_ = ParseState::kExpectChunkData;
+        }
+
+        if (parseState_ == ParseState::kExpectChunkData) {
+            if (buf->readableBytes() < currentChunkSize_ + 2) {
+                // 半包防御，等待更多数据
+                return;
+            }
+            
+            chunkedBuffer_.append(buf->peek(), currentChunkSize_);
+            buf->retrieve(currentChunkSize_ + 2);
+            currentChunkSize_ = 0;
+            parseState_ = ParseState::kExpectChunkSize;
+
+            // 对脱壳后的数据进行 SSE 事件切割
+            while (true) {
+                size_t crlfPos = chunkedBuffer_.findCRLF(std::string_view("\n\n", 2));
+                if (crlfPos == std::string::npos) { // 没有接收到完整数据重新等待
+                    break;
+                }
+                std::string sseData(chunkedBuffer_.peek(), crlfPos);
+                chunkedBuffer_.retrieve(crlfPos + 2);
+                if (responseCallback_) {
+                    responseCallback_(sseData);
+                }
+            }
+        }
+    }
 }
 
+/**
+ * @brief 组装并发送完整的 HTTP POST 请求
+ * @details 将 pendingRequestBody_ 包装为合法 HTTP 报文（请求行 + 请求头 + 空行 + 请求体），
+ *   通过 backendConn_->send() 发出。由 connectionCallback_ 在 TLS 握手成功后自动调用。
+ */
 void HttpClient::sendRequest() {
     if (!connected_ || !backendConn_) {
         LOG_ERROR << "HttpClient::sendRequest: 未连接到后端 API";
