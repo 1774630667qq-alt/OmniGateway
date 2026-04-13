@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-04-08 15:56:09
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-12 16:54:54
+ * @LastEditTime: 2026-04-13 19:27:26
  * @FilePath: /OmniGateway/src/HttpClient.cpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
  * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
@@ -168,18 +168,22 @@ void HttpClient::onClose(const std::shared_ptr<TcpConnection>& conn) {
         backendConn_.reset();
     }
 
+    // 【关键修复】：不能直接 responseCallback_ = nullptr！
+    // 如果 lambda 捕获了 shared_ptr<HttpClient>（client），直接赋 nullptr 会触发：
+    //   ~lambda → ~client → ~HttpClient → ~responseCallback_（二次析构）→ 崩溃
+    // 正确做法：move 到局部变量，让回调在 onClose 返回后才析构。
+    // 同时在析构前发送熔断信号。
+    auto oldCallback = std::move(responseCallback_);
+    // responseCallback_ 现在是空的（moved-from），不会被 ~HttpClient 再次析构
+
     // 2. 异常熔断通知（防死锁兜底机制）
     // 如果大模型正常发完，最后一条通常是 data: [DONE]\n\n，前端收到就会自动结束。
     // 但如果网络突然断了，我们最好通过回调给前端发一个伪造的异常断开信号，防止前端死等。
-    if (responseCallback_) {
-        // 构建一个特定的内部信号，供上层（网关转发层）识别并处理
-        // 注意：这里可以根据你实际的 JSON 结构约定一个内部的错误格式
+    if (oldCallback) {
         std::string errorSignal = "data: {\"error\": \"Gateway backend connection closed unexpectedly\"}\n\n";
-        responseCallback_(errorSignal);
-        
-        // 可选：为了彻底安全，你还可以追加发送一个 [DONE] 让前端死心
-        // responseCallback_("data: [DONE]\n\n");
+        oldCallback(errorSignal);
     }
+    // oldCallback 在这里析构，此时 onClose 即将返回，安全。
 }
 
 /**

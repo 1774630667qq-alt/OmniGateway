@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-03-26 17:41:20
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-11 17:05:40
+ * @LastEditTime: 2026-04-13 19:17:09
  * @FilePath: /ServerPractice/src/HttpServer.cpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -54,20 +54,24 @@ namespace MyServer {
                 return;
             }
 
-            // 验证是否完整收到了请求体（如果有 Content-Length）
+            // 验证是否完整收到了请求体（如果有 Content-Length，大小写不敏感）
+            // HTTP header 名称是大小写不敏感的 (RFC 2616)
+            // Node.js undici 发送的是 "content-length" (全小写)
+            size_t content_length = 0;
+            bool hasContentLength = false;
             if (request.findHeader("Content-Length")) {
-                size_t content_length = 0;
                 try {
                     content_length = std::stoul(request.getHeader("Content-Length"));
-                } catch (const std::exception& e) {
-                    LOG_ERROR << "Failed to parse Content-Length: " << e.what();
-                    HttpResponse response;
-                    response.setStatusCode(400, "Bad Request");
-                    response.setBody("400 Bad Request");
-                    conn->send(response.assemble());
-                    conn->forceClose();
-                    return;
-                }
+                    hasContentLength = true;
+                } catch (...) {}
+            }
+            if (!hasContentLength && request.findHeader("content-length")) {
+                try {
+                    content_length = std::stoul(request.getHeader("content-length"));
+                    hasContentLength = true;
+                } catch (...) {}
+            }
+            if (hasContentLength) {
                 if (buffer->readableBytes() < headerLen + content_length) {
                     // 头部 + body 还没收全，继续等待
                     return;
@@ -80,10 +84,9 @@ namespace MyServer {
             size_t total_request_length = headerLen + request.getBody().size();
             buffer->retrieve(total_request_length); // 从 Buffer 中删掉已经处理完的请求
 
-            HttpResponse response;
-            pool_->enqueue([cb, conn, request, response]() mutable {
+            pool_->enqueue([cb, conn, request]() mutable {
                 if (cb) {
-                    cb(request, response); // 业务层处理请求，填充响应
+                    cb(request, conn); // 业务层处理请求，填充响应
                 }
             });
         }

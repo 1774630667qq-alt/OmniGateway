@@ -82,7 +82,7 @@ namespace MyServer {
                 int readbytes = SSL_read(ssl_, extrabuf, sizeof(extrabuf));
                 if (readbytes > 0) { // 成功读取到数据
                     buffer_.append(extrabuf, readbytes);
-                    extendLife();
+
                     gotNewData = true;
                 } else { 
                     /**
@@ -175,7 +175,7 @@ namespace MyServer {
 
             if (n > 0) {
                 // 成功读取到数据，续命并触发业务层回调
-                extendLife();
+
                 if (messageCallback_) {
                     messageCallback_(guard, &buffer_);
                 }
@@ -347,48 +347,14 @@ namespace MyServer {
         }
     }
 
-    void TcpConnection::extendLife() {
-        // 1. 如果之前已经有一个秒表了，我们直接把它“标记删除”（惰性删除，O(1)复杂度）
-        // 这样大管家在处理时会自动忽略它，极其高效！
-        if (keepAliveTimer_) {
-            keepAliveTimer_->setDeleted();
-        }
 
-        // 2. 重新开启一个 30 秒的定时器！
-        std::weak_ptr<TcpConnection> weak_conn = shared_from_this();
-
-        keepAliveTimer_ = loop_->runAfter(30000, [weak_conn]() {
-            // 闹钟响了，尝试把 weak_ptr 提升为 shared_ptr
-            auto conn = weak_conn.lock();
-            if (conn) {
-                // 如果提升成功，说明连接还没被常规途径关闭，立刻执行踢人逻辑！
-                conn->handleTimeout();
-            }
-        });
-    }
-
-    void TcpConnection::handleTimeout() {
-        LOG_WARNING << "客户端 fd " << fd_ << " 长时间未发送数据，心跳超时，强制踢出！";
-        // kHandshaking 或 kConnected 均可被超时踢出
-        if (state_ == StateE::kDisconnecting || state_ == StateE::kDisconnected) return;
-        state_ = StateE::kDisconnecting;
-        channel_->disableAll(); // 立即从 epoll 中注销，防止后续事件重入
-        // 触发关闭回调，TcpServer 会负责把它从账本里删掉，并销毁堆内存
-        auto guard = shared_from_this();
-        if (closeCallback_) {
-            closeCallback_(guard);
-        }
-    }
 
     void TcpConnection::forceClose() {
         if (state_ == StateE::kConnected || state_ == StateE::kHandshaking) {
             auto guard = shared_from_this();
             // 1. 立即修改状态机，防止新的读写事件被调度
             state_ = StateE::kDisconnecting;
-            // 2. 取消所有定时器
-            if (keepAliveTimer_) {
-                keepAliveTimer_->setDeleted();
-            }
+
             // 将任务丢回到 I/O 线程中处理
             loop_->queueInLoop([this, guard]() {
                 channel_->disableAll(); // 在 IO 线程中注销 epoll，防止后续事件重入
@@ -405,9 +371,7 @@ namespace MyServer {
         state_ = StateE::kDisconnected;
         channel_->disableAll();
 
-        if (keepAliveTimer_) {
-            keepAliveTimer_->setDeleted();
-        }
+
         
         auto guard = shared_from_this();
         

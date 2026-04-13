@@ -12,7 +12,7 @@
 #include <memory>
 #include <sys/types.h> // 提供 off_t 类型
 #include "Buffer.hpp"
-#include "Timer.hpp"
+
 #include <atomic>
 
 typedef struct ssl_st SSL;
@@ -49,7 +49,7 @@ private:
     Channel* channel_;      ///< 属于这个 fd 的专属通信管道 (服务员)
     Buffer buffer_;         ///< 读数据的缓冲区
     Buffer writeBuffer_;    ///< 写数据的缓冲区
-    std::shared_ptr<Timer> keepAliveTimer_; ///< 专属秒表：如果长时间没重置，它就会引爆！
+
     std::atomic<StateE> state_; ///< 原子状态机，用于表示连接的状态
 
     // --- 给上层大老板 (TcpServer) 留的汇报接口 ---
@@ -63,10 +63,7 @@ private:
     ///< 当连接完全建立时（明文直接连上，或 TLS 握手成功后）触发此回调
     ConnectionCallBack connectionCallback_;
 
-    /**
-     * @brief 定时器引爆时执行的踢人函数
-     */
-    void handleTimeout();
+
 
     /**
      * @brief 处理连接关闭事件
@@ -153,10 +150,7 @@ public:
      */
     void connectEstablished();
 
-    /**
-     * @brief 为当前连接续命 (重置秒表)
-     */
-    void extendLife();
+
 
     /**
      * @brief 零拷贝发送文件接口

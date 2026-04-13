@@ -67,7 +67,7 @@ void TcpServer::newConnection(int fd) {
     //    这样可以保证 Channel 注册到正确线程的 epoll 中，且不会在 map 登记前就触发事件
     ioLoop->queueInLoop([conn]() {
         conn->connectEstablished();
-        conn->extendLife();
+
     });
 }
 

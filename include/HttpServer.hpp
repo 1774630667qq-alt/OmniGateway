@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-03-26 17:07:48
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-02 15:08:58
+ * @LastEditTime: 2026-04-13 18:58:46
  * @FilePath: /ServerPractice/include/HttpServer.hpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -14,6 +14,7 @@
 #include <functional>
 #include "Buffer.hpp"
 #include <memory>
+#include "TcpConnection.hpp"
 
 namespace MyServer {
 
@@ -24,7 +25,7 @@ namespace MyServer {
 class HttpServer {
 public:
     // 现代 Web 框架标志性的回调函数签名：给我一个请求，我还你一个响应
-    using HttpCallback = std::function<void(const HttpRequest&, HttpResponse&)>;
+    using HttpCallback = std::function<void(const HttpRequest&, std::shared_ptr<TcpConnection>&)>;
 
 private:
     TcpServer server_;          ///< 底层的 TCP 服务器
