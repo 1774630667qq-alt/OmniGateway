@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-04-08 15:56:09
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-13 19:27:26
+ * @LastEditTime: 2026-04-14 10:35:04
  * @FilePath: /OmniGateway/src/HttpClient.cpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
  * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
@@ -13,12 +13,15 @@
 #include <unistd.h>
 #include "SSLManager.hpp"
 #include "Logger.hpp"
+#include "ThreadPool.hpp"
 #include "HttpParser.hpp"
 
 namespace MyServer {
-HttpClient::HttpClient(EventLoop* loop, const InetAddress& serverAddr, const ApiConfig& apiConfig)
+HttpClient::HttpClient(EventLoop* loop, ThreadPool* pool, const std::string& hostname, int port, ApiConfig& apiConfig)
     : loop_(loop),
-    connector_(std::make_shared<Connector>(loop, serverAddr)),
+    threadPool_(pool),
+    targethost_(hostname),
+    targetport_(port),
     apiConfig_(apiConfig),
     connected_(false) {
     
@@ -32,10 +35,32 @@ HttpClient::~HttpClient() {
 }
 
 void HttpClient::connect() {
-    connector_->setNewConnectionCallback([this](int sockfd){
-        onConnection(sockfd);
+    LOG_INFO << "开始异步解析域名"<< targethost_ << ":" << targetport_;
+    
+    auto self = shared_from_this();
+
+    threadPool_->enqueue([this, self]() {
+        std::string resolvedIp;
+        
+        bool success = InetAddress::resolve(targethost_, resolvedIp);
+        
+        loop_->queueInLoop([this, self, success, resolvedIp]() {
+            if (success) {
+                LOG_INFO << "域名解析成功: " << targethost_ << " -> " << resolvedIp;
+                
+                InetAddress addr(targetport_, resolvedIp);
+                
+                self->doConnection(addr);
+            } else {
+                LOG_ERROR << "域名解析失败: " << targethost_;
+                
+                if (responseCallback_) {
+                    responseCallback_("data: {\"error\": \"DNS Resolution Failed\"}\n\n");
+                    responseCallback_("data: [DONE]\n\n");
+                }
+            }
+        });
     });
-    connector_->start();
 }
 
 void HttpClient::onConnection(int sockfd) {
@@ -334,5 +359,14 @@ void HttpClient::sendRequest() {
     backendConn_->send(httpPacket);
 
     LOG_INFO << "HTTP 请求已发送至后端 API: " << apiConfig_.host << apiConfig_.path;
+}
+
+void HttpClient::doConnection(const InetAddress& addr) {
+    connector_ = std::make_shared<Connector>(loop_, addr);
+    connector_->setNewConnectionCallback([this] (int sockfd) {
+        this->onConnection(sockfd);
+    });
+
+    connector_->start();
 }
 }// namespace MyServer

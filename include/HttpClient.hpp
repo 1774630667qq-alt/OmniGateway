@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-04-08 15:56:09
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-11 22:22:08
+ * @LastEditTime: 2026-04-14 10:16:05
  * @FilePath: /OmniGateway/include/HttpClient.hpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
  * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
@@ -13,7 +13,7 @@
 #include "HttpParser.hpp"
 
 namespace MyServer {
-
+class ThreadPool;
 /**
  * @brief 后端 API 连接配置结构体
  * @details 封装了与一个大模型 API 后端节点通信所需的全部参数。
@@ -71,7 +71,7 @@ public:
      *   构造阶段仅创建 Connector 实例并保存配置，不会立即发起网络连接。
      *   必须显式调用 connect() 才会启动连接状态机。
      */
-    HttpClient(EventLoop* loop, const InetAddress& serverAddr, const ApiConfig& apiConfig);
+    HttpClient(EventLoop* loop, ThreadPool* pool, const std::string& hostname, int port, ApiConfig& apiConfig);
 
     /**
      * @brief 析构函数：释放客户端资源并执行安全清理
@@ -169,6 +169,13 @@ private:
     void sendRequest();
 
     /**
+     * @brief 域名解析完成后，建立 TCP 连接
+     * @signature void doConnection(const InetAddress& resolvedAddr);
+     * @param resolvedAddr 域名解析后的 IP 地址和端口
+     */
+    void doConnection(const InetAddress& resolvedAddr);
+
+    /**
      * @brief HTTP 响应体解析状态机枚举
      * @details 头部解析阶段已委托给 HttpParser（响应模式），
      *   此枚举仅管理头部解析完成后的 Chunked 数据处理流程。
@@ -196,5 +203,9 @@ private:
     bool connected_ = false;                         ///< 当前是否与后端 API 处于已连接状态
     bool headersParsed_ = false;                     ///< 头部是否已被 HttpParser 解析完毕
     std::string pendingRequestBody_;                 ///< 暂存待发送的 JSON 请求体（connect 前存入，握手后自动发送）
+    std::string targethost_;                         ///< 目标域名，如"api.edgefn.net"
+    int targetport_;                                 ///< 目标端口，如443
+
+    ThreadPool* threadPool_;                         ///< 在线程池异步执行阻塞方法
 };
 } // namespace MyServer

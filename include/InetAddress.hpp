@@ -6,7 +6,7 @@
  * @LastEditors: Zhang YuHua 1774630667@qq.com
  * install git && error: git config user.email & please set dead value or
  * install git & please set dead value or install git
- * @LastEditTime: 2026-04-06 19:07:52
+ * @LastEditTime: 2026-04-14 09:29:56
  * @FilePath: /OmniGateway/include/InetAddress.hpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
  * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
@@ -44,6 +44,16 @@ public:
     socklen_t getSockAddrLen() const { return sizeof(addr_); }
 
     void setSockAddr(const sockaddr_in& addr) { addr_ = addr; }
+
+    /**
+     * @brief 静态方法，通过主机名解析 IP 地址
+     * @details 使用 getaddrinfo 进行 DNS 解析
+     * @param hostname 主机名
+     * @param OutIp 输出的 IP 地址
+     * @return true 解析成功
+     * @return false 解析失败
+     */
+    static bool resolve(const std::string& hostname, std::string& OutIp);
 
 private:
     // 真正存储地址的地方：Linux 系统定义的 IPv4 地址结构体
