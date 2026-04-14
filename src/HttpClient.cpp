@@ -170,10 +170,9 @@ void HttpClient::onConnection(int sockfd) {
     backendConn_ = conn;
     connected_ = true;
 
-    // 在 IO 线程中安全地注册 epoll 读事件，然后发起 TLS 握手
+    // 在 IO 线程中安全地注册 epoll 读事件并自动发起 TLS 握手
     loop_->queueInLoop([conn]() {
         conn->connectEstablished();
-        conn->doTlsHandshake();
     });
 }
 

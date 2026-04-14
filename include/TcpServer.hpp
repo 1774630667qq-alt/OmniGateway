@@ -64,10 +64,15 @@ public:
 
     /**
      * @brief 迎宾员接到新客人后，触发此函数
-     * @details 内部会为新连接实例化 TcpConnection 对象，并将其注册到 connections_
-     * 账本中。 另外会给该连接分配对应的读事件回调(onMessageCallback_) 和
-     * 退出回调(removeConnection)。
      * @param fd 客户端的文件描述符
+     * @details
+     *   内部完整流程：
+     *   1. SSL_new(serverCtx_)        —— 从服务端 CTX 派生 SSL 会话对象
+     *   2. SSL_set_fd(ssl, fd)        —— 将 SSL 绑定到客户端 socket（BIO_NOCLOSE 模式）
+     *   3. SSL_set_accept_state(ssl)  —— 将 SSL 显式标记为服务端角色
+     *   4. 创建 TcpConnection 对象，注册到 connections_ 账本
+     *   5. 设置消息回调 / 关闭回调 / 连接建立回调
+     *   6. 投递 connectEstablished 到 IO 线程，自动触发 TLS 握手
      */
     void newConnection(int fd);
 

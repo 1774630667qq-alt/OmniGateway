@@ -5,8 +5,8 @@ OmniGateway 是一个高性能 C++ 协议翻译网关，将 **Claude Code (Anthr
 ## 架构概览
 
 ```
-Claude Code CLI ──(Anthropic SSE)──▶ OmniGateway ──(OpenAI SSE)──▶ 后端大模型 API
-                ◀──(Anthropic SSE)──              ◀──(OpenAI SSE)──
+Claude Code CLI ──(HTTPS/TLS)──▶ OmniGateway ──(HTTPS/TLS)──▶ 后端大模型 API
+                ◀──(HTTPS/TLS)──              ◀──(HTTPS/TLS)──
 ```
 
 **核心数据流：**
@@ -23,7 +23,7 @@ Claude Code CLI ──(Anthropic SSE)──▶ OmniGateway ──(OpenAI SSE)─
 - **思考文本分离**：将后端 `reasoning_content` 映射为 Claude 的 `thinking` content block
 - **工具调用翻译**：Claude `tool_use` ↔ OpenAI `function_calling` 双向转换
 - **异步 DNS 解析**：在线程池中执行阻塞 DNS 查询，不阻塞事件循环
-- **TLS 加密通信**：通过 OpenSSL 与后端 HTTPS API 安全通信
+- **全链路 TLS 加密**：前端（客户端→网关）和后端（网关→API）均通过 OpenSSL 全程加密
 - **JSON 配置文件**：所有参数均通过 `gateway_config.json` 配置，无需重编译
 - **Multi-Reactor 线程模型**：主线程 Accept + IO 线程池处理连接
 
@@ -109,7 +109,21 @@ cmake .. && make -j$(nproc)
 | `backend.api_key` | API 密钥 |
 | `backend.target_model` | 目标模型名称 |
 
-### 4. 启动网关
+### 4. 生成前端 SSL 证书（首次必需）
+
+网关前端使用 HTTPS，首次需生成包含 **SAN**（Subject Alternative Name）扩展字段的自签名证书。普通的 CN-only 证书在现代 TLS 客户端中会报 hostname mismatch。
+
+```bash
+cd OmniGateway
+openssl req -x509 -newkey rsa:2048 \
+  -keyout certs/server.key \
+  -out certs/server.crt \
+  -days 3650 -nodes \
+  -subj "/CN=127.0.0.1" \
+  -addext "subjectAltName=IP:127.0.0.1,IP:::1"
+```
+
+### 5. 启动网关
 
 ```bash
 cd build
@@ -118,10 +132,21 @@ cd build
 
 ### 5. 配置 Claude Code 连接网关
 
+网关使用 HTTPS，需要让 Claude Code 信任自签名证书。由于 **Node.js 不读取系统 CA 库**（`update-ca-certificates` 对 Node.js 无效），需通过 `NODE_EXTRA_CA_CERTS` 追加信任：
+
 ```bash
 export ANTHROPIC_API_KEY="any-key-here"
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
+export ANTHROPIC_BASE_URL="https://127.0.0.1:8080"
+export NODE_EXTRA_CA_CERTS=/home/bazinga/OmniGateway/certs/server.crt
 claude --dangerously-skip-permissions
+```
+
+建议将以上三行写入 `~/.bashrc`，避免每次手动 export：
+
+```bash
+echo 'export ANTHROPIC_API_KEY="any-key-here"' >> ~/.bashrc
+echo 'export ANTHROPIC_BASE_URL="https://127.0.0.1:8080"' >> ~/.bashrc
+echo 'export NODE_EXTRA_CA_CERTS=/home/bazinga/OmniGateway/certs/server.crt' >> ~/.bashrc
 ```
 
 > **说明**：`ANTHROPIC_API_KEY` 可以填任意值（网关不校验），真正的后端密钥在 `gateway_config.json` 中配置。
