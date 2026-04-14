@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-04-08 15:56:09
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-14 10:16:05
+ * @LastEditTime: 2026-04-14 11:17:57
  * @FilePath: /OmniGateway/include/HttpClient.hpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
  * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
@@ -11,27 +11,10 @@
 #include "TcpConnection.hpp"
 #include "Connector.hpp"
 #include "HttpParser.hpp"
+#include "ConfigManager.hpp"
 
 namespace MyServer {
 class ThreadPool;
-/**
- * @brief 后端 API 连接配置结构体
- * @details 封装了与一个大模型 API 后端节点通信所需的全部参数。
- *   在反向代理场景中，OmniGateway 收到前端用户请求后，会根据此配置
- *   构建 HTTP 请求报文并发往对应的后端大模型服务。
- * 
- *   各字段说明：
- *   - host:        后端 API 的域名或 IP（用于 HTTP Host 头和 DNS 解析），例如 "api.edgefn.net"
- *   - path:        请求的 URI 路径（如 "/v1/chat/completions"）
- *   - apiKey:      后端 API 的鉴权密钥（如 "sk-..."），将被填入 Authorization 头
- *   - targetModel: 要调用的目标模型标识（如 "GLM-5"），将被填入请求体的 model 字段
- */
-struct ApiConfig {
-    std::string host;       ///< 后端 API 域名，例如 "api.edgefn.net"
-    std::string path;       ///< 请求路径，例如 "/v1/chat/completions"
-    std::string apiKey;     ///< 鉴权密钥，例如 "sk-..."
-    std::string targetModel;///< 目标模型标识，例如 "GLM-5"
-};
 
 /**
  * @class HttpClient

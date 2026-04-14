@@ -2,15 +2,15 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-04-04 16:15:45
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-13 20:56:47
+ * @LastEditTime: 2026-04-14 11:34:00
  * @FilePath: /OmniGateway/src/main.cpp
- * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
- * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+ * @Description: OmniGateway 主入口：协议翻译网关，将 Claude Code 请求转发至 OpenAI 兼容后端
  */
 #include "EventLoop.hpp"
 #include "HttpServer.hpp"
 #include "HttpClient.hpp"
 #include "ProtocolTranslator.hpp"
+#include "ConfigManager.hpp"
 #include "SSLManager.hpp"
 #include "Logger.hpp"
 #include <signal.h>
@@ -19,29 +19,40 @@
 using namespace MyServer;
 
 int main() {
-    // 1. 基础环境初始化 (忽略管线破裂信号，防止强退)
+    // ================================================================
+    // 1. 基础环境初始化
+    // ================================================================
     signal(SIGPIPE, SIG_IGN);
     MyServer::initGlobalLogger("OmniGatewayLog");
     SSLManager::init();
 
+    // ================================================================
+    // 2. 加载配置文件
+    // ================================================================
+    auto& config = ConfigManager::getInstance();
+    if (!config.loadConfig("../gateway_config.json")) {
+        LOG_ERROR << "配置文件加载失败，程序退出！";
+        return 1;
+    }
+    const auto& serverCfg = config.getServerConfig();
+    auto apiCfg = config.getApiConfig();
+
+    // ================================================================
+    // 3. 启动事件循环与线程池
+    // ================================================================
     EventLoop loop;
-    ThreadPool pool(4); // 供 HttpServer 的回调使用
+    ThreadPool pool(4); // 通用线程池：DNS 解析等阻塞操作在此执行
 
-    // 2. 启动前端接待服务器 (监听 8080 端口，接收 Claude Code 的请求)
-    HttpServer gateway(&loop, 8080, &pool);
-    gateway.setThreadNum(4);
+    // ================================================================
+    // 4. 启动前端 HTTP 网关服务器
+    // ================================================================
+    HttpServer gateway(&loop, serverCfg.port, &pool);
+    gateway.setThreadNum(serverCfg.threadNum);
 
-    // 3. 配置后端大模型 API (此处为白山智算)
-    ApiConfig backendConfig;
-    backendConfig.host = "api.edgefn.net";
-    backendConfig.path = "/v1/chat/completions";
-    // 从环境变量读取密钥，避免硬编码泄露
-    const char* envKey = std::getenv("OMNI_API_KEY");
-    backendConfig.apiKey = envKey ? envKey : "sk-your-api-key-here"; // 【务必修改】设置环境变量 OMNI_API_KEY
-    backendConfig.targetModel = "GLM-5";
-
-    // 4. 网关核心大闭环：接管前端的 TCP 连接 (frontConn)
-    gateway.setHttpCallback([&loop, backendConfig](const HttpRequest& req, const std::shared_ptr<TcpConnection>& frontConn) {
+    // ================================================================
+    // 5. 网关核心路由：接管前端 TCP 连接并转发至后端大模型
+    // ================================================================
+    gateway.setHttpCallback([&loop, &pool, apiCfg](const HttpRequest& req, const std::shared_ptr<TcpConnection>& frontConn) mutable {
         LOG_INFO << "收到前端请求: " << req.getPath();
 
         // 提取纯路径（去掉查询参数 ?xxx）
@@ -51,11 +62,12 @@ int main() {
             purePath = purePath.substr(0, queryPos);
         }
 
-        // 拦截 Claude Code 发往 Anthropic 官方的请求
+        // ============================================================
+        // 路由 1: /v1/messages (POST) — 核心代理路由
+        // ============================================================
         if (purePath == "/v1/messages" && req.getMethod() == "POST") {
             
-            // 【步骤 A】：立刻向 Claude Code 发送 HTTP 响应头，宣告开启流式通道！
-            // 注意：frontConn 属于 IO 子线程，必须投递到其 EventLoop
+            // 【步骤 A】：立刻发送 SSE 响应头，开启流式通道
             std::string sseHeaders = 
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: text/event-stream\r\n"
@@ -66,7 +78,7 @@ int main() {
             });
 
             // 【步骤 B】：同声传译 (Claude 格式 -> OpenAI 格式)
-            std::string openaiReq = ProtocolTranslator::translateRequest(req.getBody(), backendConfig.targetModel);
+            std::string openaiReq = ProtocolTranslator::translateRequest(req.getBody(), apiCfg.targetModel);
             if (openaiReq.empty()) {
                 LOG_ERROR << "请求翻译失败，断开前端连接";
                 frontConn->getLoop()->queueInLoop([frontConn]() {
@@ -75,17 +87,15 @@ int main() {
                 return;
             }
 
-            // 【步骤 C + D】：在 main loop 线程上创建 HttpClient 并发起连接
-            // HttpClient::connect() 会修改 main loop 的 epoll，必须在 main loop 线程执行！
-            // 否则多个 pool 线程同时 connect() 会发生竞态条件导致段错误。
-            loop.queueInLoop([&loop, frontConn, backendConfig, openaiReq]() {
-                InetAddress serverAddr(443, "198.18.0.87");
-                auto client = std::make_shared<HttpClient>(&loop, serverAddr, backendConfig);
+            // 【步骤 C】：创建 HttpClient，通过 DNS 解析 + TLS 连接后端 API
+            // HttpClient 内部会在 ThreadPool 中异步 DNS 解析，然后回到 EventLoop 发起连接
+            loop.queueInLoop([&loop, &pool, frontConn, apiCfg, openaiReq]() mutable {
+                auto client = std::make_shared<HttpClient>(&loop, &pool, apiCfg.host, 443, apiCfg);
                 client->setRequestBody(openaiReq);
 
+                // 【步骤 D】：注册响应回调 — 同声传译 (OpenAI 数据流 -> Claude 数据流)
                 auto streamState = std::make_shared<StreamState>();
                 client->setResponseCallback([frontConn, client, streamState](const std::string& openaiSse) {
-                    // 同声传译 (OpenAI 数据流 -> Claude 数据流)
                     std::string claudeSse = ProtocolTranslator::translateSseEvent(openaiSse, *streamState);
                     if (!claudeSse.empty()) {
                         std::string data = claudeSse;
@@ -110,7 +120,9 @@ int main() {
                 client->connect();
             });
         } 
-        // Claude Code 启动时的健康检查端点
+        // ============================================================
+        // 路由 2: /api/hello — Claude Code 健康检查
+        // ============================================================
         else if (purePath == "/api/hello") {
             std::string body = "{\"status\":\"ok\"}";
             std::string resp = 
@@ -121,7 +133,9 @@ int main() {
             frontConn->send(resp);
             LOG_INFO << "健康检查通过: /api/hello";
         }
-        // Claude Code 可能发送的其他 API 探测请求，返回 200 避免误判
+        // ============================================================
+        // 路由 3: /v1/* 和 /api/* — 兜底路由，返回 200
+        // ============================================================
         else if (purePath.find("/v1/") == 0 || purePath.find("/api/") == 0) {
             std::string body = "{}";
             std::string resp = 
@@ -132,15 +146,17 @@ int main() {
             frontConn->send(resp);
             LOG_INFO << "API 兜底路由 (200): " << req.getPath();
         }
+        // ============================================================
+        // 路由 4: 其他路径 — 404
+        // ============================================================
         else {
-            // 非 API 路径的兜底路由（不 forceClose，避免多线程堆损坏）
             std::string notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             frontConn->send(notFound);
             LOG_INFO << "未知路径 (404): " << req.getPath();
         }
     });
 
-    LOG_INFO << "🚀 OmniGateway 引擎启动成功！正在监听 8080 端口...";
+    LOG_INFO << "🚀 OmniGateway 引擎启动成功！正在监听 " << serverCfg.port << " 端口...";
     gateway.start();
     loop.loop();
     

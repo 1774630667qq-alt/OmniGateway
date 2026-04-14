@@ -19,3 +19,6 @@ compile_commands.json
 *.key
 # 忽略证书目录（或者按需保留 crt，但绝对不能留 key）
 certs/
+
+# Gateway config
+gateway_config.json
