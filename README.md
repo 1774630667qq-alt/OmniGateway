@@ -65,7 +65,9 @@ OmniGateway/
     └── json.hpp                 # nlohmann/json 库
 ```
 
-## 快速开始
+## 快速开始（本地部署）
+
+> 适用于在本机（WSL / 原生 Linux）运行网关，Claude Code 通过 `127.0.0.1` 连接。
 
 ### 1. 环境要求
 
@@ -122,6 +124,7 @@ cmake .. && make -j$(nproc)
 
 ```bash
 cd OmniGateway
+mkdir -p certs
 openssl req -x509 -newkey rsa:2048 \
   -keyout certs/server.key \
   -out certs/server.crt \
@@ -144,19 +147,167 @@ cd build
 ```bash
 export ANTHROPIC_API_KEY="any-key-here"
 export ANTHROPIC_BASE_URL="https://127.0.0.1:8080"
-export NODE_EXTRA_CA_CERTS=/home/bazinga/OmniGateway/certs/server.crt
+export NODE_EXTRA_CA_CERTS=/path/to/OmniGateway/certs/server.crt
 claude --dangerously-skip-permissions
 ```
 
-建议将以上三行写入 `~/.bashrc`，避免每次手动 export：
+建议将以上三行写入 `~/.bashrc`，避免每次手动 export。
+
+> **说明**：`ANTHROPIC_API_KEY` 可以填任意值（网关不校验），真正的后端密钥在 `gateway_config.json` 中配置。
+
+---
+
+## 云服务器部署
+
+> 适用于将网关部署到具有公网 IP 的云服务器，Claude Code 从本地或其他机器远程连接。
+
+### 1. 服务端：环境准备
+
+在云服务器上安装依赖并克隆项目：
+
+```bash
+sudo apt update && sudo apt install -y build-essential cmake libssl-dev git
+
+git clone https://github.com/1774630667qq-alt/OmniGateway.git
+cd OmniGateway
+mkdir -p build && cd build
+cmake .. && make -j$(nproc)
+```
+
+### 2. 服务端：生成 SSL 证书
+
+证书的 SAN 必须包含服务器的**公网 IP**，否则 Claude Code 连接时会报 hostname mismatch：
+
+```bash
+cd OmniGateway
+mkdir -p certs
+openssl req -x509 -newkey rsa:2048 \
+  -keyout certs/server.key \
+  -out certs/server.crt \
+  -days 3650 -nodes \
+  -subj "/CN=你的公网IP" \
+  -addext "subjectAltName=IP:你的公网IP"
+```
+
+### 3. 服务端：配置网关
+
+编辑 `gateway_config.json`，填入后端 API 信息：
+
+```json
+{
+    "server": {
+        "port": 8080,
+        "thread_num": 4,
+        "log_level": "WARNING"
+    },
+    "backend": {
+        "host": "api.edgefn.net",
+        "path": "/v1/chat/completions",
+        "api_key": "sk-your-real-api-key",
+        "target_model": "GLM-5"
+    }
+}
+```
+
+### 4. 服务端：开放防火墙端口
+
+网关默认监听 8080 端口，需确保该端口对外可访问：
+
+```bash
+# 方式一：ufw（Ubuntu 默认）
+sudo ufw allow 8080/tcp
+
+# 方式二：iptables
+sudo iptables -A INPUT -p tcp --dport 8080 -j ACCEPT
+```
+
+> **重要**：同时需要在云服务商控制台（如阿里云安全组、腾讯云防火墙）中放行 **TCP 8080 入站**规则。
+
+### 5. 服务端：启动网关
+
+```bash
+# 前台运行（调试用）
+cd build && ./OmniGateway
+
+# 后台运行（生产用）
+cd build && nohup ./OmniGateway > /dev/null 2>&1 &
+
+# 或使用 systemd 托管（推荐）
+# 参见下方 systemd 配置
+```
+
+**可选：创建 systemd 服务实现开机自启：**
+
+```bash
+sudo tee /etc/systemd/system/omnigateway.service << 'EOF'
+[Unit]
+Description=OmniGateway Protocol Translation Gateway
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/OmniGateway/build
+ExecStart=/path/to/OmniGateway/build/OmniGateway
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now omnigateway
+```
+
+### 6. 客户端：下载证书并配置 Claude Code
+
+在你的**本地机器**（运行 Claude Code 的地方）执行：
+
+```bash
+# 第一步：从云服务器下载证书到本地
+scp user@你的公网IP:~/OmniGateway/certs/server.crt ~/omnigateway.crt
+
+# 第二步：配置环境变量
+export ANTHROPIC_API_KEY="any-key-here"
+export ANTHROPIC_BASE_URL="https://你的公网IP:8080"
+export NODE_EXTRA_CA_CERTS=~/omnigateway.crt
+
+# 第三步：启动 Claude Code
+claude --dangerously-skip-permissions
+```
+
+建议写入 `~/.bashrc` 实现持久化：
 
 ```bash
 echo 'export ANTHROPIC_API_KEY="any-key-here"' >> ~/.bashrc
-echo 'export ANTHROPIC_BASE_URL="https://127.0.0.1:8080"' >> ~/.bashrc
-echo 'export NODE_EXTRA_CA_CERTS=/home/bazinga/OmniGateway/certs/server.crt' >> ~/.bashrc
+echo 'export ANTHROPIC_BASE_URL="https://你的公网IP:8080"' >> ~/.bashrc
+echo 'export NODE_EXTRA_CA_CERTS=~/omnigateway.crt' >> ~/.bashrc
 ```
 
-> **说明**：`ANTHROPIC_API_KEY` 可以填任意值（网关不校验），真正的后端密钥在 `gateway_config.json` 中配置。
+### 7. 验证部署
+
+在本地终端测试连通性：
+
+```bash
+# 测试 TCP 端口是否可达
+nc -zv 你的公网IP 8080
+
+# 测试 HTTPS 是否正常（忽略证书校验）
+curl -k https://你的公网IP:8080/api/hello
+# 期望返回：{"status":"ok"}
+```
+
+### 本地 vs 云服务器对比
+
+| 项目 | 本地部署 | 云服务器部署 |
+|-----|---------|------------|
+| 代码修改 | 无 | 无 |
+| 监听地址 | `0.0.0.0:8080` | `0.0.0.0:8080` |
+| SSL 证书 SAN | `IP:127.0.0.1` | `IP:公网IP` |
+| `ANTHROPIC_BASE_URL` | `https://127.0.0.1:8080` | `https://公网IP:8080` |
+| 证书分发 | 本地直接引用 | 需 scp 到客户端 |
+| 防火墙 | 无需配置 | 需放行端口 |
+| 后端 API 连接 | 可能需要代理 | 通常可直连 |
 
 ---
 
