@@ -2,7 +2,7 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-04-08 15:56:09
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-14 10:35:04
+ * @LastEditTime: 2026-04-15 11:58:03
  * @FilePath: /OmniGateway/src/HttpClient.cpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
  * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
@@ -23,7 +23,8 @@ HttpClient::HttpClient(EventLoop* loop, ThreadPool* pool, const std::string& hos
     targethost_(hostname),
     targetport_(port),
     apiConfig_(apiConfig),
-    connected_(false) {
+    connected_(false),
+    lastActiveTime_(std::chrono::steady_clock::now()) {
     
 }
 
@@ -35,6 +36,24 @@ HttpClient::~HttpClient() {
 }
 
 void HttpClient::connect() {
+    // 长连接复用：如果已有存活连接，跳过 DNS/TCP/TLS，直接发送请求
+    if (isConnected()) {
+        LOG_INFO << "复用已有 TLS 连接，跳过 DNS/TCP/TLS";
+        sendRequest();
+        return;
+    }
+
+    // 清理可能存在的旧连接残留（空闲超时或异常断开后未被 onClose 清理的情况）
+    if (connector_) {
+        connector_->stop();  // 停止旧 Connector 的重试定时器，防止残留回调
+        connector_.reset();
+    }
+    if (backendConn_) {
+        backendConn_->forceClose();
+        backendConn_.reset();
+        connected_ = false;
+    }
+
     LOG_INFO << "开始异步解析域名"<< targethost_ << ":" << targetport_;
     
     auto self = shared_from_this();
@@ -169,6 +188,7 @@ void HttpClient::onConnection(int sockfd) {
 
     backendConn_ = conn;
     connected_ = true;
+    lastActiveTime_ = std::chrono::steady_clock::now();
 
     // 在 IO 线程中安全地注册 epoll 读事件并自动发起 TLS 握手
     loop_->queueInLoop([conn]() {
@@ -177,8 +197,10 @@ void HttpClient::onConnection(int sockfd) {
 }
 
 /**
- * @brief 后端连接物理关闭时的回调
- * @details 释放 backendConn_ 引用，并通过 responseCallback_ 发送异常熔断信号，
+ * @brief 后端连接物理关闭时的回调（仅在异常断开时触发）
+ * @details 长连接模式下，正常的请求完成走 responseCompleteCallback_，
+ *   onClose 仅在后端主动断开（超时、错误）时触发。
+ *   释放 backendConn_ 引用，并通过 responseCallback_ 发送异常熔断信号，
  *   防止前端在网络突然中断时无限等待。
  */
 void HttpClient::onClose(const std::shared_ptr<TcpConnection>& conn) {
@@ -192,13 +214,12 @@ void HttpClient::onClose(const std::shared_ptr<TcpConnection>& conn) {
         backendConn_.reset();
     }
 
-    // 【关键修复】：不能直接 responseCallback_ = nullptr！
-    // 如果 lambda 捕获了 shared_ptr<HttpClient>（client），直接赋 nullptr 会触发：
-    //   ~lambda → ~client → ~HttpClient → ~responseCallback_（二次析构）→ 崩溃
-    // 正确做法：move 到局部变量，让回调在 onClose 返回后才析构。
-    // 同时在析构前发送熔断信号。
+    // 【关键】：同时清理 responseCallback_ 和 responseCompleteCallback_
+    // responseCompleteCallback_ 持有 RAII connGuard 的 shared_ptr，
+    // 必须在 onClose 中释放，否则 RAII 永远不析构、freeConn 永远不被调用。
     auto oldCallback = std::move(responseCallback_);
-    // responseCallback_ 现在是空的（moved-from），不会被 ~HttpClient 再次析构
+    auto oldCompleteCallback = std::move(responseCompleteCallback_);
+    // 两个回调现在都是空的（moved-from）
 
     // 2. 异常熔断通知（防死锁兜底机制）
     // 如果大模型正常发完，最后一条通常是 data: [DONE]\n\n，前端收到就会自动结束。
@@ -218,12 +239,16 @@ void HttpClient::onClose(const std::shared_ptr<TcpConnection>& conn) {
  *   阶段三：Chunked 脱壳 → SSE 事件切割 → 逐条回传前端
  */
 void HttpClient::onMessage(const std::shared_ptr<TcpConnection>& conn, Buffer* buf) {
-    
+    lastActiveTime_ = std::chrono::steady_clock::now();
+
     // ================= 阶段一：解析 HTTP 头部 =================
     if (!headersParsed_) {
         bool ok = httpParser_.parse(buf);
         if (!ok) {
-            LOG_ERROR << "HTTP 响应头解析失败";
+            // 转储前 64 字节原始数据，便于定位是代理串台还是协议错误
+            std::string dump(buf->peek(), std::min(static_cast<size_t>(64), 
+                             static_cast<size_t>(buf->readableBytes())));
+            LOG_ERROR << "HTTP 响应头解析失败，原始数据(前64B): [" << dump << "]";
             conn->forceClose();
             return;
         }
@@ -233,9 +258,12 @@ void HttpClient::onMessage(const std::shared_ptr<TcpConnection>& conn, Buffer* b
             return; 
         }
 
-        // 头部彻底解析完成，开始提取核心参数
         headersParsed_ = true;
         int code = httpParser_.statusCode();
+
+        // 解析后端是否支持 keep-alive（HTTP/1.1 默认 keep-alive）
+        std::string connHeader = httpParser_.getHeader("Connection");
+        keepAlive_ = (connHeader != "close");
 
         if (code == 200) {
             if (httpParser_.getHeader("Transfer-Encoding") == "chunked") {
@@ -292,8 +320,15 @@ void HttpClient::onMessage(const std::shared_ptr<TcpConnection>& conn, Buffer* b
             buf->retrieve(crlfPos + 2);
 
             if (currentChunkSize_ == 0) {
-                LOG_INFO << "大模型API响应结束, 物理断开连接";
-                conn->forceClose();
+                LOG_INFO << "大模型 API 响应完成";
+                if (keepAlive_ && responseCompleteCallback_) {
+                    // 长连接模式：保持连接，通知上层"响应完成，可以归还"
+                    auto cb = std::move(responseCompleteCallback_);
+                    cb();
+                } else {
+                    // 短连接模式或后端不支持 keep-alive：正常断开
+                    conn->forceClose();
+                }
                 return;
             }
 
@@ -351,11 +386,13 @@ void HttpClient::sendRequest() {
     httpPacket += "Content-Type: application/json\r\n";
     httpPacket += "Authorization: Bearer " + apiConfig_.apiKey + "\r\n";
     httpPacket += "Content-Length: " + std::to_string(pendingRequestBody_.size()) + "\r\n";
+    httpPacket += "Connection: keep-alive\r\n";
     httpPacket += "\r\n";
     // 拼接请求体
     httpPacket += pendingRequestBody_;
     // 发送 HTTP 请求
     backendConn_->send(httpPacket);
+    lastActiveTime_ = std::chrono::steady_clock::now();
 
     LOG_INFO << "HTTP 请求已发送至后端 API: " << apiConfig_.host << apiConfig_.path;
 }
@@ -367,5 +404,19 @@ void HttpClient::doConnection(const InetAddress& addr) {
     });
 
     connector_->start();
+}
+
+void HttpClient::reset() {
+    responseCallback_ = nullptr;
+    responseCompleteCallback_ = nullptr;
+    pendingRequestBody_.clear();
+    chunkedBuffer_.retrieveAll();
+    currentChunkSize_ = 0;
+    expectedErrorLength_ = 0;
+    parseState_ = kExpectChunkSize;
+    httpParser_.reset();
+    headersParsed_ = false;
+    // 注意：不清理 backendConn_、connected_、connector_、keepAlive_
+    // 这些属于"连接级"状态，由 onClose 或析构函数管理
 }
 }// namespace MyServer

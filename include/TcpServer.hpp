@@ -108,6 +108,11 @@ public:
      * @param numThreads 线程池数量
      */
     void setThreadNum(int numThreads) { threadPool_->setThreadNum(numThreads); }
+
+    /**
+     * @brief 获取内部 IO 线程池指针
+     */
+    EventLoopThreadPool* getThreadPool() { return threadPool_.get(); }
 };
 
 } // namespace MyServer

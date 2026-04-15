@@ -32,6 +32,18 @@ bool ConfigManager::loadConfig(const std::string &configFilePath) {
             const auto &serverJson = configJson["server"];
             serverConfig_.port = serverJson.value("port", 8080);
             serverConfig_.threadNum = serverJson.value("thread_num", 4);
+
+            // 解析日志级别：INFO / WARNING / ERROR / FATAL
+            std::string logLevelStr = serverJson.value("log_level", "INFO");
+            if (logLevelStr == "WARNING" || logLevelStr == "WARN") {
+                setLogLevel(LogLevel::WARNING);
+            } else if (logLevelStr == "ERROR") {
+                setLogLevel(LogLevel::ERROR);
+            } else if (logLevelStr == "FATAL") {
+                setLogLevel(LogLevel::FATAL);
+            } else {
+                setLogLevel(LogLevel::INFO);
+            }
         } else {
             LOG_WARNING << "配置文件中未找到 server 配置，使用默认值";
         }

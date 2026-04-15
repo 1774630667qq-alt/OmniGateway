@@ -2,16 +2,18 @@
  * @Author: Zhang YuHua 1774630667@qq.com
  * @Date: 2026-04-08 15:56:09
  * @LastEditors: Zhang YuHua 1774630667@qq.com
- * @LastEditTime: 2026-04-14 11:17:57
+ * @LastEditTime: 2026-04-15 13:31:09
  * @FilePath: /OmniGateway/include/HttpClient.hpp
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置
  * 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
+#pragma once
 #include "EventLoop.hpp"
 #include "TcpConnection.hpp"
 #include "Connector.hpp"
 #include "HttpParser.hpp"
 #include "ConfigManager.hpp"
+#include <chrono>
 
 namespace MyServer {
 class ThreadPool;
@@ -22,7 +24,7 @@ class ThreadPool;
  * @details
  *   [架构角色]
  *   在 OmniGateway 的反向代理架构中，HttpClient 处于"下游客户端"的角色。
- *   当前端用户通过 HttpServer 发来请求后，业务层会创建一个 HttpClient 实例，
+ *   当前端用户通过 HttpServer 发来请求后，业务层从连接池中借出一个 HttpClient 实例，
  *   由它主动连接后端大模型 API 节点（如智谱、OpenAI），转发请求并将响应回传。
  * 
  *   [生命周期]
@@ -44,14 +46,20 @@ public:
     /// 响应回调类型：当从后端 API 收到完整 HTTP 响应或一段 SSE 流式数据时触发
     using HttpResponseCallback = std::function<void(const std::string& responseData)>;
 
+    /// 响应完成回调类型：SSE 流正常结束时触发（区别于 onClose 的异常断开）
+    /// 连接池 RAII 守卫通过此回调得知请求已完成，自动归还连接
+    using ResponseCompleteCallback = std::function<void()>;
+
     /**
      * @brief 构造函数：初始化客户端，绑定事件循环与连接器
-     * @signature HttpClient(EventLoop* loop, const InetAddress& serverAddr, const ApiConfig& apiConfig);
+     * @signature HttpClient(EventLoop* loop, ThreadPool* pool, const std::string& hostname, int port, ApiConfig& apiConfig);
      * @param loop 当前 HttpClient 将要运行在的 EventLoop（IO 线程）
-     * @param serverAddr 后端大模型 API 服务的网络地址（IP + 端口）
+     * @param pool 通用线程池，用于异步 DNS 解析
+     * @param hostname 后端 API 域名（如 "api.edgefn.net"）
+     * @param port 后端 API 端口（如 443）
      * @param apiConfig 后端 API 的配置信息（域名、路径、密钥、模型名）
      * @details
-     *   构造阶段仅创建 Connector 实例并保存配置，不会立即发起网络连接。
+     *   构造阶段仅保存配置信息，不会立即发起网络连接。
      *   必须显式调用 connect() 才会启动连接状态机。
      */
     HttpClient(EventLoop* loop, ThreadPool* pool, const std::string& hostname, int port, ApiConfig& apiConfig);
@@ -97,6 +105,38 @@ public:
     void setResponseCallback(HttpResponseCallback cb) {
         responseCallback_ = std::move(cb);
     }
+
+    /**
+     * @brief 清空上一次请求级状态（Body、回调、Buffer），保留连接级状态（backendConn_、connected_）
+     * @details 长连接模式下，reset() 不销毁底层 TcpConnection，使连接可被复用。
+     */
+    void reset();
+
+    /**
+     * @brief 当前连接是否处于已连接且可复用的状态
+     * @return true 底层 TcpConnection 存活且未超过空闲超时阈值
+     * @details 空闲超时设为 kMaxIdleSeconds 秒（后端 API 通常在 ~60 秒后主动断开空闲连接），
+     *   提前标记为不可用，避免在连接即将被关闭时发起请求。
+     */
+    bool isConnected() const {
+        if (!connected_ || !backendConn_) return false;
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - lastActiveTime_).count();
+        return elapsed < kMaxIdleSeconds;
+    }
+
+    /**
+     * @brief 设置响应完成回调（由连接池 RAII 守卫注册）
+     * @param cb SSE 流正常结束时触发的回调，用于归还连接到池中
+     */
+    void setResponseCompleteCallback(ResponseCompleteCallback cb) {
+        responseCompleteCallback_ = std::move(cb);
+    }
+
+    // 禁用拷贝/赋值：HttpClient 持有活跃网络连接资源，
+    // 连接池通过 shared_ptr 管理对象引用，不需要值语义。
+    HttpClient(const HttpClient&) = delete;
+    HttpClient& operator=(const HttpClient&) = delete;
 
 private:
     /**
@@ -144,10 +184,12 @@ private:
      * @details
      *   [职责]
      *   将 pendingRequestBody_ 中暂存的 JSON 包装成合法的 HTTP 报文
-     *   （请求行 + 请求头 + 空行 + 请求体），通过 backendConn_->send() 发出。
+     *   （请求行 + 请求头 + Connection: keep-alive + 空行 + 请求体），
+     *   通过 backendConn_->send() 发出。
      * 
      *   [调用时机]
-     *   由 connectionCallback_ 在 TLS 握手成功后自动触发，外部不应直接调用。
+     *   - 首次请求：由 connectionCallback_ 在 TLS 握手成功后自动触发
+     *   - 复用请求：由 connect() 检测到已有连接后直接调用
      */
     void sendRequest();
 
@@ -182,9 +224,13 @@ private:
     ApiConfig apiConfig_;                            ///< 后端 API 配置（域名、路径、密钥、模型）
     
     HttpResponseCallback responseCallback_;          ///< 跨线程桥梁：将后端响应回传至前端 HttpServer
+    ResponseCompleteCallback responseCompleteCallback_; ///< 响应正常完成时归还连接的回调
     
     bool connected_ = false;                         ///< 当前是否与后端 API 处于已连接状态
     bool headersParsed_ = false;                     ///< 头部是否已被 HttpParser 解析完毕
+    bool keepAlive_ = false;                         ///< 后端是否支持 keep-alive（从响应头解析）
+    static constexpr int kMaxIdleSeconds = 50;       ///< 空闲超时阈值（秒），超过则认为连接不可复用
+    std::chrono::steady_clock::time_point lastActiveTime_;  ///< 最近一次活跃时间（连接建立/数据收发/归还）
     std::string pendingRequestBody_;                 ///< 暂存待发送的 JSON 请求体（connect 前存入，握手后自动发送）
     std::string targethost_;                         ///< 目标域名，如"api.edgefn.net"
     int targetport_;                                 ///< 目标端口，如443

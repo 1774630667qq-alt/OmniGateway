@@ -24,6 +24,17 @@ enum class LogLevel {
 };
 
 /**
+ * @brief 设置全局最低日志级别（低于此级别的日志将被过滤）
+ * @param level 最低日志级别，默认 INFO（全部输出）
+ */
+void setLogLevel(LogLevel level);
+
+/**
+ * @brief 获取当前全局最低日志级别
+ */
+LogLevel getLogLevel();
+
+/**
  * @brief 面向用户的日志包装类
  * @details 它的生命周期极短！通常作为临时对象存在于一行代码中。
  * 构造时：记录时间戳、文件、行号等头部信息。
@@ -64,9 +75,13 @@ private:
 // 编译器会展开为：Logger(__FILE__, __LINE__, LogLevel::INFO).stream() << "hello";
 // 这会创建一个匿名的 Logger 临时对象。当这行代码执行完（遇到分号），临时对象被销毁，触发析构函数！
 
-#define LOG_INFO    MyServer::Logger(__FILE__, __LINE__, MyServer::LogLevel::INFO).stream()
-#define LOG_WARNING MyServer::Logger(__FILE__, __LINE__, MyServer::LogLevel::WARNING).stream()
-#define LOG_ERROR   MyServer::Logger(__FILE__, __LINE__, MyServer::LogLevel::ERROR).stream()
-#define LOG_FATAL   MyServer::Logger(__FILE__, __LINE__, MyServer::LogLevel::FATAL).stream()
+#define LOG_INFO    if (MyServer::LogLevel::INFO >= MyServer::getLogLevel()) \
+                    MyServer::Logger(__FILE__, __LINE__, MyServer::LogLevel::INFO).stream()
+#define LOG_WARNING if (MyServer::LogLevel::WARNING >= MyServer::getLogLevel()) \
+                    MyServer::Logger(__FILE__, __LINE__, MyServer::LogLevel::WARNING).stream()
+#define LOG_ERROR   if (MyServer::LogLevel::ERROR >= MyServer::getLogLevel()) \
+                    MyServer::Logger(__FILE__, __LINE__, MyServer::LogLevel::ERROR).stream()
+#define LOG_FATAL   if (MyServer::LogLevel::FATAL >= MyServer::getLogLevel()) \
+                    MyServer::Logger(__FILE__, __LINE__, MyServer::LogLevel::FATAL).stream()
 
 } // namespace MyServer

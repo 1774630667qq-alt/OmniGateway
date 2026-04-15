@@ -62,6 +62,13 @@ public:
     void setThreadNum(int numThreads) {
         server_.setThreadNum(numThreads);
     }
+
+    /**
+     * @brief 获取内部的 IO 线程池指针，供连接池初始化使用
+     */
+    EventLoopThreadPool* getThreadPool() {
+        return server_.getThreadPool();
+    }
 };
 
 } // namespace MyServer

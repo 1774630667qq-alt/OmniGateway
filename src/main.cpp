@@ -12,6 +12,8 @@
 #include "ProtocolTranslator.hpp"
 #include "ConfigManager.hpp"
 #include "SSLManager.hpp"
+#include "ConnectionPool.hpp"
+#include "ConnectPoolRAII.hpp"
 #include "Logger.hpp"
 #include <signal.h>
 #include <memory>
@@ -50,9 +52,9 @@ int main() {
     gateway.setThreadNum(serverCfg.threadNum);
 
     // ================================================================
-    // 5. 网关核心路由：接管前端 TCP 连接并转发至后端大模型
+    // 6. 网关核心路由：接管前端 TCP 连接并转发至后端大模型
     // ================================================================
-    gateway.setHttpCallback([&loop, &pool, apiCfg](const HttpRequest& req, const std::shared_ptr<TcpConnection>& frontConn) mutable {
+    gateway.setHttpCallback([&pool, apiCfg](const HttpRequest& req, const std::shared_ptr<TcpConnection>& frontConn) mutable {
         LOG_INFO << "收到前端请求: " << req.getPath();
 
         // 提取纯路径（去掉查询参数 ?xxx）
@@ -87,38 +89,57 @@ int main() {
                 return;
             }
 
-            // 【步骤 C】：创建 HttpClient，通过 DNS 解析 + TLS 连接后端 API
-            // HttpClient 内部会在 ThreadPool 中异步 DNS 解析，然后回到 EventLoop 发起连接
-            loop.queueInLoop([&loop, &pool, frontConn, apiCfg, openaiReq]() mutable {
-                auto client = std::make_shared<HttpClient>(&loop, &pool, apiCfg.host, 443, apiCfg);
-                client->setRequestBody(openaiReq);
-
-                // 【步骤 D】：注册响应回调 — 同声传译 (OpenAI 数据流 -> Claude 数据流)
-                auto streamState = std::make_shared<StreamState>();
-                client->setResponseCallback([frontConn, client, streamState](const std::string& openaiSse) {
-                    std::string claudeSse = ProtocolTranslator::translateSseEvent(openaiSse, *streamState);
-                    if (!claudeSse.empty()) {
-                        std::string data = claudeSse;
-                        frontConn->getLoop()->queueInLoop([frontConn, data]() {
-                            frontConn->send(data);
-                        });
-                    }
-
-                    // 检测流结束：后端发来 [DONE] 时关闭前端连接
-                    std::string trimmed = openaiSse;
-                    while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\n' || trimmed.front() == '\r')) trimmed.erase(trimmed.begin());
-                    while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\n' || trimmed.back() == '\r')) trimmed.pop_back();
-                    if (trimmed == "[DONE]" || trimmed == "data: [DONE]") {
-                        LOG_INFO << "SSE 流结束，投递关闭前端连接";
-                        frontConn->getLoop()->queueInLoop([frontConn]() {
-                            frontConn->forceClose();
-                        });
-                    }
+            // 【步骤 C】：从连接池借出 HttpClient（长连接可能已预热）
+            // connGuard 被 responseCallback 和 responseCompleteCallback 同时捕获，
+            // 当 reset() 清空两个回调后，引用计数归零 → RAII 析构 → freeConn()
+            EventLoop* ioLoop = frontConn->getLoop();
+            std::shared_ptr<HttpClient> client;
+            auto connGuard = std::make_shared<ConnectionPoolRAII>(&client, &ConnectionPool::instance(), ioLoop);
+            
+            if (!client) {
+                LOG_ERROR << "连接池借出失败";
+                frontConn->getLoop()->queueInLoop([frontConn]() {
+                    frontConn->forceClose();
                 });
+                return;
+            }
 
-                LOG_INFO << "请求翻译完毕，代理客户端发起后台连接...";
-                client->connect();
+            client->setRequestBody(openaiReq);
+
+            // 【步骤 D】：注册响应回调 — 同声传译 (OpenAI 数据流 -> Claude 数据流)
+            // 注意：此 lambda 不捕获 connGuard，避免与 responseCompleteCallback 形成引用计数死锁
+            auto streamState = std::make_shared<StreamState>();
+            client->setResponseCallback([frontConn, streamState](const std::string& openaiSse) {
+                std::string claudeSse = ProtocolTranslator::translateSseEvent(openaiSse, *streamState);
+                if (!claudeSse.empty()) {
+                    std::string data = claudeSse;
+                    frontConn->getLoop()->queueInLoop([frontConn, data]() {
+                        frontConn->send(data);
+                    });
+                }
+
+                // 检测流结束：后端发来 [DONE] 时关闭前端连接
+                std::string trimmed = openaiSse;
+                while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\n' || trimmed.front() == '\r')) trimmed.erase(trimmed.begin());
+                while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '\n' || trimmed.back() == '\r')) trimmed.pop_back();
+                if (trimmed == "[DONE]" || trimmed == "data: [DONE]") {
+                    LOG_INFO << "SSE 流结束，投递关闭前端连接";
+                    frontConn->getLoop()->queueInLoop([frontConn]() {
+                        frontConn->forceClose();
+                    });
+                }
             });
+
+            // 【步骤 E】：注册响应完成回调 — 长连接归还触发点
+            // 当 chunked 尾块到达且后端支持 keep-alive 时，HttpClient 调用此回调。
+            // reset() 清空此 lambda → connGuard 引用减少 → 配合 responseCallback 清空后
+            // 引用计数归零 → RAII 析构 → freeConn() → 连接归还池中（仍存活）
+            client->setResponseCompleteCallback([connGuard]() {
+                // connGuard 捕获在此，生命周期延长至 reset() 时
+            });
+
+            LOG_INFO << "请求翻译完毕，从连接池借出客户端发起后台连接...";
+            client->connect();
         } 
         // ============================================================
         // 路由 2: /api/hello — Claude Code 健康检查
@@ -158,6 +179,13 @@ int main() {
 
     LOG_INFO << "🚀 OmniGateway 引擎启动成功！正在监听 " << serverCfg.port << " 端口...";
     gateway.start();
+
+    // ================================================================
+    // 5. 初始化 HTTPS 长连接池（必须在 IO 线程启动后）
+    // ================================================================
+    ConnectionPool::instance().Init(
+        gateway.getThreadPool(), &pool, apiCfg.host, 443, apiCfg);
+
     loop.loop();
     
     SSLManager::destroy();

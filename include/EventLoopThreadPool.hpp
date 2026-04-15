@@ -45,6 +45,12 @@ public:
      */
     EventLoop* getNextLoop();
 
+    /**
+     * @brief 获取线程池中的线程数量
+     * @return int 线程池中的线程数量
+     */
+    int size() const { return numThreads_; }
+
 private:
     EventLoop* baseLoop_;   ///< 基础循环 (总经理)，当没有子线程时，一切都靠它自己扛
     bool started_;          ///< 状态标志：线程池是否已经启动？
