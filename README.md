@@ -261,19 +261,39 @@ sudo systemctl enable --now omnigateway
 
 ### 6. 客户端：下载证书并配置 Claude Code
 
-在你的**本地机器**（运行 Claude Code 的地方）执行：
+在你的**本地机器**（运行 Claude Code 的地方）执行以下操作。根据你的操作系统选择对应的指令：
+
+#### 第一步：从云服务器下载证书到本地
+
+<details>
+<summary><b>Linux / macOS / WSL</b></summary>
 
 ```bash
-# 第一步：从云服务器下载证书到本地
-scp user@你的公网IP:~/OmniGateway/certs/server.crt ~/omnigateway.crt
+scp root@你的公网IP:~/OmniGateway/certs/server.crt ~/omnigateway.crt
+```
 
-# 第二步：配置环境变量
+</details>
+
+<details>
+<summary><b>Windows (PowerShell)</b></summary>
+
+```powershell
+scp root@你的公网IP:~/OmniGateway/certs/server.crt $env:USERPROFILE\omnigateway.crt
+```
+
+</details>
+
+> **说明**：`scp` 使用 `root@` 用户名。如果你在服务器上创建了其他用户，请替换为对应的用户名。
+
+#### 第二步：配置环境变量
+
+<details>
+<summary><b>Linux / WSL (Bash)</b></summary>
+
+```bash
 export ANTHROPIC_API_KEY="any-key-here"
 export ANTHROPIC_BASE_URL="https://你的公网IP:8080"
 export NODE_EXTRA_CA_CERTS=~/omnigateway.crt
-
-# 第三步：启动 Claude Code
-claude --dangerously-skip-permissions
 ```
 
 建议写入 `~/.bashrc` 实现持久化：
@@ -282,11 +302,92 @@ claude --dangerously-skip-permissions
 echo 'export ANTHROPIC_API_KEY="any-key-here"' >> ~/.bashrc
 echo 'export ANTHROPIC_BASE_URL="https://你的公网IP:8080"' >> ~/.bashrc
 echo 'export NODE_EXTRA_CA_CERTS=~/omnigateway.crt' >> ~/.bashrc
+source ~/.bashrc
 ```
+
+</details>
+
+<details>
+<summary><b>macOS (Zsh)</b></summary>
+
+```zsh
+export ANTHROPIC_API_KEY="any-key-here"
+export ANTHROPIC_BASE_URL="https://你的公网IP:8080"
+export NODE_EXTRA_CA_CERTS=~/omnigateway.crt
+```
+
+建议写入 `~/.zshrc` 实现持久化：
+
+```zsh
+echo 'export ANTHROPIC_API_KEY="any-key-here"' >> ~/.zshrc
+echo 'export ANTHROPIC_BASE_URL="https://你的公网IP:8080"' >> ~/.zshrc
+echo 'export NODE_EXTRA_CA_CERTS=~/omnigateway.crt' >> ~/.zshrc
+source ~/.zshrc
+```
+
+</details>
+
+<details>
+<summary><b>Windows (PowerShell) — 临时设置（当前会话有效）</b></summary>
+
+```powershell
+$env:ANTHROPIC_API_KEY = "any-key-here"
+$env:ANTHROPIC_BASE_URL = "https://你的公网IP:8080"
+$env:NODE_EXTRA_CA_CERTS = "$env:USERPROFILE\omnigateway.crt"
+```
+
+</details>
+
+<details>
+<summary><b>Windows (PowerShell) — 永久设置（写入用户环境变量）</b></summary>
+
+```powershell
+[System.Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", "any-key-here", "User")
+[System.Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", "https://你的公网IP:8080", "User")
+[System.Environment]::SetEnvironmentVariable("NODE_EXTRA_CA_CERTS", "$env:USERPROFILE\omnigateway.crt", "User")
+```
+
+> **注意**：永久设置后需要**重启 PowerShell** 窗口才能生效。
+
+</details>
+
+<details>
+<summary><b>Windows (CMD)</b></summary>
+
+```cmd
+set ANTHROPIC_API_KEY=any-key-here
+set ANTHROPIC_BASE_URL=https://你的公网IP:8080
+set NODE_EXTRA_CA_CERTS=%USERPROFILE%\omnigateway.crt
+```
+
+如需永久设置，使用 `setx` 命令：
+
+```cmd
+setx ANTHROPIC_API_KEY "any-key-here"
+setx ANTHROPIC_BASE_URL "https://你的公网IP:8080"
+setx NODE_EXTRA_CA_CERTS "%USERPROFILE%\omnigateway.crt"
+```
+
+</details>
+
+> **说明**：`ANTHROPIC_API_KEY` 可以填任意值（网关不校验），真正的后端密钥在服务端 `gateway_config.json` 中配置。
+
+#### 第三步：启动 Claude Code
+
+所有平台通用：
+
+```bash
+claude --dangerously-skip-permissions
+```
+
+> 在 Windows 上，建议在 **WSL** 或 **Git Bash** 中运行 Claude Code。如果在 PowerShell 中运行，请确保 `claude` 已加入 PATH。
 
 ### 7. 验证部署
 
 在本地终端测试连通性：
+
+<details>
+<summary><b>Linux / macOS / WSL</b></summary>
 
 ```bash
 # 测试 TCP 端口是否可达
@@ -296,6 +397,37 @@ nc -zv 你的公网IP 8080
 curl -k https://你的公网IP:8080/api/hello
 # 期望返回：{"status":"ok"}
 ```
+
+</details>
+
+<details>
+<summary><b>Windows (PowerShell)</b></summary>
+
+```powershell
+# 测试 TCP 端口是否可达
+Test-NetConnection -ComputerName 你的公网IP -Port 8080
+
+# 测试 HTTPS 是否正常（忽略证书校验）
+# PowerShell 7+
+Invoke-WebRequest -Uri "https://你的公网IP:8080/api/hello" -SkipCertificateCheck
+# PowerShell 5.x（需先跳过证书检查）
+[System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+Invoke-WebRequest -Uri "https://你的公网IP:8080/api/hello"
+```
+
+</details>
+
+<details>
+<summary><b>Windows (CMD)</b></summary>
+
+```cmd
+# 测试 TCP 端口是否可达（需安装 curl）
+curl -k https://你的公网IP:8080/api/hello
+```
+
+> Windows 10/11 自带 `curl.exe`，可在 CMD 中直接使用。但在 PowerShell 中 `curl` 是 `Invoke-WebRequest` 的别名，参数不同，请注意区分。
+
+</details>
 
 ### 本地 vs 云服务器对比
 
