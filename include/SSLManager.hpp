@@ -95,6 +95,26 @@ public:
             LOG_FATAL << "私钥和证书不匹配！";
         }
 
+        /**
+         * @brief 设置 SSL 选项，禁用 TLS 重协商（Renegotiation）
+         * @details
+         *   [问题背景]
+         *   在非阻塞事件驱动模型中，当外部客户端通过网络连接时，OpenSSL 可能在
+         *   SSL_read() 过程中触发 TLS 重协商（TLS 1.2）或 KeyUpdate（TLS 1.3），
+         *   导致 SSL_read() 返回 SSL_ERROR_WANT_WRITE。当前的事件循环虽然会注册
+         *   EPOLLOUT，但 handleWrite() 只处理 writeBuffer_ 中的应用层数据，
+         *   无法正确驱动 OpenSSL 内部的重协商写出需求，从而导致连接死锁。
+         *
+         *   [解决方案]
+         *   通过 SSL_OP_NO_RENEGOTIATION 禁用服务端发起的 TLS 重协商，
+         *   从根源上避免 SSL_read() 返回 WANT_WRITE 的场景。
+         *   这不影响正常的 TLS 1.3 握手和数据传输。
+         *
+         *   [适用范围]
+         *   SSL_OP_NO_RENEGOTIATION 在 OpenSSL 1.1.1+ 中可用。
+         */
+        SSL_CTX_set_options(serverCtx_, SSL_OP_NO_RENEGOTIATION);
+
         // 2. 初始化 Client 模具
         /**
          * @brief 获取客户端视角的通用 SSL/TLS 方法，创建负责向外代理转发流量的主上下文模具

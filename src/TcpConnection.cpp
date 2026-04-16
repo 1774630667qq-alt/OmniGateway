@@ -198,6 +198,10 @@ namespace MyServer {
         if (state_ != StateE::kConnected) return;
         if (writeBuffer_.empty()) {
             channel_->disableWriting();
+            // 如果 writeBuffer_ 为空但 EPOLLOUT 被触发，可能是因为
+            // SSL_read() 之前返回了 WANT_WRITE（例如 TLS 重协商或 KeyUpdate 期间）。
+            // 此时需要在写操作完成后重新尝试读取。
+            handleRead();
             return;
         }
 
@@ -324,8 +328,8 @@ namespace MyServer {
         off_t fileSize = ::lseek(fileFd, 0, SEEK_END);
         ::lseek(fileFd, 0, SEEK_SET);
 
-        // SSL connections cannot use sendfile() zero-copy;
-        // must read into userspace then send via SSL_write
+        // SSL 连接无法使用 sendfile() 零拷贝；
+        // 必须先读取到用户空间缓冲区，再通过 SSL_write 发送
         char buf[65536];
         off_t remaining = fileSize;
         while (remaining > 0) {
