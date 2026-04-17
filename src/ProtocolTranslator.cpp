@@ -187,7 +187,7 @@ std::string ProtocolTranslator::translateSseEvent(const std::string& openaiSseDa
         json messageDelta = {
             {"type", "message_delta"},
             {"delta", {{"stop_reason", "end_turn"}}},
-            {"usage", {{"output_tokens", 0}}}
+            {"usage", {{"input_tokens", 0}, {"output_tokens", 0}}}
         };
         result += "event: message_delta\ndata: " + messageDelta.dump() + "\n\n";
         result += "event: message_stop\ndata: {\"type\": \"message_stop\"}\n\n";
@@ -385,7 +385,7 @@ std::string ProtocolTranslator::translateSseEvent(const std::string& openaiSseDa
             json messageDelta = {
                 {"type", "message_delta"},
                 {"delta", {{"stop_reason", stopReason}}},
-                {"usage", {{"output_tokens", 0}}}
+                {"usage", {{"input_tokens", 0}, {"output_tokens", 0}}}
             };
             result += "event: message_delta\ndata: " + messageDelta.dump() + "\n\n";
         }
